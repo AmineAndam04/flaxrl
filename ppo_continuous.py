@@ -194,6 +194,7 @@ if __name__ == "__main__":
         hidden_dim=args.actor_hidden_dim,
         num_layers=args.actor_num_layers,
         output_dim=env.action_size,
+        log_std_init=args.log_std_init,
         rngs=rngs,
     )
     critic = Critic(
