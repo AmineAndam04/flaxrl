@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+
+class JaxRLEnv(ABC):
+    @abstractmethod
+    def reset(self, key):
+        """Should return: obs, state"""
+        pass
+
+    @abstractmethod
+    def step(self, key, state, action):
+        """Should return : obs, state, reward, terminated, truncated, info"""
+        pass
+
+    @property
+    @abstractmethod
+    def observation_space(self): ...
+
+    @property
+    @abstractmethod
+    def action_space(self): ...
+
+    @property
+    @abstractmethod
+    def observation_size(self): ...
+
+    @property
+    @abstractmethod
+    def action_size(self): ...
+
+    @property
+    def unwrapped(self):
+        return self
