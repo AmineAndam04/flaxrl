@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import distrax
-import gymnax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -15,12 +14,28 @@ import tyro
 from flax import nnx
 from tensorboardX import SummaryWriter
 
+from envs.make_env import make_env
+
 
 @dataclass
 class Args:
     # Environment
-    env_name: str = "Pendulum-v1"
-    """ Name of the environment"""
+    env_type: str = "brax"
+    """ gymnax, brax, playground """
+    env_name: str = "hopper"
+    """ Name of the environment """
+    normalize_obs: bool = False
+    """ Normalize the observations if True"""
+    normalize_reward: bool = False
+    """ Normalize the rewards if True"""
+    max_episode_steps: int = 1000
+    """ Maximum steps per episode"""
+    clip_actions: bool = False
+    """ Clip actions before env.step """
+    backend: str = "generalized"  # brax
+    """ For brax envs: generalized", positional, spring """
+    impl: str = "jax"
+    """ For playground: jax , warp"""
     # Network
     actor_hidden_dim: int = 32
     """ Hidden dimension of actor network"""
@@ -30,6 +45,8 @@ class Args:
     """ Hidden dimension of critic network"""
     critic_num_layers: int = 1
     """ Number of hidden layers of critic network"""
+    log_std_init: float = -1
+    """ Initial log std """
     # Training
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
@@ -85,6 +102,7 @@ class Actor(nnx.Module):
         hidden_dim: int,
         num_layers: int,
         output_dim: int,
+        log_std_init: float,
         *,
         rngs: nnx.Rngs,
     ):
@@ -96,7 +114,7 @@ class Actor(nnx.Module):
             nnx.Linear(hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(0.01), rngs=rngs)
         )
         self.mean = nnx.Sequential(*layers)
-        self.log_std = nnx.Param(jnp.zeros(output_dim))
+        self.log_std = nnx.Param(jnp.zeros(output_dim) + log_std_init)
 
     def __call__(self, obs: jnp.ndarray) -> distrax.MultivariateNormalDiag:
         mean = self.mean(obs)
@@ -134,14 +152,10 @@ class Critic(nnx.Module):
 ## it includes - obs: the current observation, used to take the action
 ##             - env_state: the current state of the environment
 ##             - key: to sample actions
-##             - episode_return: keep track of the sum of rewards during an episode
-##             - episode_length: keep track of the episode length
 class RolloutState(NamedTuple):
     obs: jax.Array
     env_state: Any
     key: jax.Array
-    episode_return: jax.Array
-    episode_length: jax.Array
 
 
 ## EpisodeStats keeps track of the episodic returns and length
@@ -173,22 +187,17 @@ if __name__ == "__main__":
     rngs = nnx.Rngs(args.seed)
     key, reset_key, shuffle_key, eval_key = jax.random.split(key, 4)
     # Import the environment
-    env, env_params = gymnax.make(args.env_name)
-    obs_dim = env.observation_space(env_params).shape[0]
-    action_dim = env.action_space(env_params).shape[0]
-    # Vectorize the environment
-    vmap_reset = jax.jit(jax.vmap(fun=env.reset, in_axes=(0, None)))
-    vmap_step = jax.jit(jax.vmap(fun=env.step, in_axes=(0, 0, 0, None)))
+    env = make_env(args)
     # Prepare networks
     actor = Actor(
-        input_dim=obs_dim,
+        input_dim=env.observation_size,
         hidden_dim=args.actor_hidden_dim,
         num_layers=args.actor_num_layers,
-        output_dim=action_dim,
+        output_dim=env.action_size,
         rngs=rngs,
     )
     critic = Critic(
-        input_dim=obs_dim,
+        input_dim=env.observation_size,
         hidden_dim=args.critic_hidden_dim,
         num_layers=args.critic_num_layers,
         rngs=rngs,
@@ -208,24 +217,18 @@ if __name__ == "__main__":
     log_dir = f"{args.work_dir}/PPO-{run_name}"
     # Reset the env
     reset_key = jax.random.split(reset_key, args.num_envs)
-    obs, env_state = vmap_reset(reset_key, env_params)
+    obs, env_state = env.reset(key=reset_key)
     # Prepare the rollout state
-    rollout_state = RolloutState(
-        obs=obs,
-        env_state=env_state,
-        key=key,
-        episode_return=jnp.zeros(args.num_envs),
-        episode_length=jnp.zeros(args.num_envs, dtype=jnp.int32),
-    )
+    rollout_state = RolloutState(obs=obs, env_state=env_state, key=key)
 
     # update_step: 1 PPO update = collect num_steps*num_env steps + compute GAE + PPO updates for n_epochs
-    @nnx.jit(donate_argnums=(0,))  # The first argument is also the first return
+    @nnx.jit  # The first argument is also the first return
     @nnx.scan(
         length=num_updates,
         in_axes=(nnx.Carry, None),
         out_axes=(nnx.Carry, 0),
     )
-    def update_step(update_state: tuple, _):
+    def update_step(update_state: tuple, _):  # noqa: PLR0915
 
         actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key = update_state
 
@@ -236,7 +239,7 @@ if __name__ == "__main__":
             # env_one_step : one step for each environment
             def env_one_step(carry, x):
                 # Last rollout state
-                obs, state, key, episode_return, episode_length = carry
+                obs, state, key = carry
                 # Keys for action-sampling and env.step
                 key, key_act, key_step = jax.random.split(key, 3)
                 key_step = jax.random.split(key_step, args.num_envs)
@@ -246,16 +249,11 @@ if __name__ == "__main__":
                 action = pi.sample(seed=key_act)
                 log_prob = pi.log_prob(action)
                 # Step the env
-                next_obs, next_state, reward, terminated, truncated, _ = vmap_step(
-                    key_step, state, action, env_params
-                )
+                next_obs, next_state, reward, terminated, truncated, info = env.step(key_step, state, action)
                 done = jnp.logical_or(terminated, truncated)
-                episode_return = episode_return + reward
-                episode_length = episode_length + 1
-                # If an env is done, record its episodic return and length
+                # Record its episodic return and length
                 episode_stats = EpisodeStats(
-                    episode_return=jnp.where(done, episode_return, jnp.zeros_like(episode_return)),
-                    episode_length=jnp.where(done, episode_length, jnp.zeros_like(episode_length)),
+                    episode_return=info["episode_return"], episode_length=info["episode_length"]
                 )
                 # Store date needed for training
                 transition = Transition(
@@ -267,13 +265,7 @@ if __name__ == "__main__":
                     value=value,
                 )
                 # Prepare the next rollout_state
-                rollout_state = RolloutState(
-                    obs=next_obs,
-                    env_state=next_state,
-                    key=key,
-                    episode_return=jnp.where(done, jnp.zeros_like(episode_return), episode_return),
-                    episode_length=jnp.where(done, jnp.zeros_like(episode_length), episode_length),
-                )
+                rollout_state = RolloutState(obs=next_obs, env_state=next_state, key=key)
                 return rollout_state, (transition, episode_stats)
 
             # Step the envs
@@ -390,13 +382,16 @@ if __name__ == "__main__":
     # Train
     update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key
     update_state, metrics = update_step(update_state, None)
+    jax.block_until_ready(metrics)
     # Evaluate
     if args.eval:
-        # Reset the envs
-        actor, _, _, _, _, _ = update_state
+        # Create eval env
+        actor, _, _, _, rollout_state, _ = update_state
+        eval_env = make_env(args, eval=True, rollout_state=rollout_state)
+        # Reset eval_env
         eval_key, reset_key = jax.random.split(eval_key)
         reset_key = jax.random.split(reset_key, args.num_eval_ep)
-        obs, env_state = vmap_reset(reset_key, env_params)
+        obs, env_state = eval_env.reset(reset_key)
         # Initialize metrics
         eval_ep_returns = jnp.zeros(args.num_eval_ep)
         eval_ep_lengths = jnp.zeros(args.num_eval_ep, dtype=jnp.int32)
@@ -414,13 +409,13 @@ if __name__ == "__main__":
             eval_key, key_step = jax.random.split(eval_key)
             key_step = jax.random.split(key_step, args.num_eval_ep)
             action = actor.get_mean(obs)
-            next_obs, next_state, reward, terminated, truncated, _ = vmap_step(
-                key_step, env_state, action, env_params
+            next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(
+                key_step, env_state, action
             )
-            active = ~ep_dones
+            active = ~ep_dones.astype(bool)
             eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
             eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
-            ep_dones = ep_dones | terminated | truncated
+            ep_dones = ep_dones.astype(bool) | terminated.astype(bool) | truncated.astype(bool)
             return next_obs, next_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key
 
         # Evaluation loop

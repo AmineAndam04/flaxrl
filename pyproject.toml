@@ -1,6 +1,6 @@
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "PL"]
-ignore = ["PLR0402","B905"]
+ignore = ["PLR0402","B905","PLC0415"]
 [tool.ruff.lint.pylint]
 max-args = 10
 
