@@ -110,10 +110,8 @@ class Actor(nnx.Module):
         self.lstm = nnx.LSTMCell(
             in_features=hidden_dim, hidden_features=hidden_dim, kernel_init=kernel_init, rngs=rngs
         )
-        self.mean = nnx.Sequential(
-            nnx.Linear(hidden_dim, hidden_dim, kernel_init=nnx.initializers.orthogonal(2), rngs=rngs),
-            nnx.tanh,
-            nnx.Linear(hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(0.01), rngs=rngs),
+        self.mean = nnx.Linear(
+            hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(0.01), rngs=rngs
         )
         self.log_std = nnx.Param(jnp.zeros(output_dim) + log_std_init)
 
@@ -128,10 +126,11 @@ class Actor(nnx.Module):
     def sequence(self, carry, obs, episode_start):
         x = self.embed(obs)
 
-        # TODO Do I need to pass the lstm
         def lstm_t(carry, xs):
             x, episode_start = xs
-            carry = jax.tree.map(lambda x: jnp.where(episode_start[:, None].astype(bool), 0.0, x), carry)
+            carry = jax.tree.map(
+                lambda x: jnp.where(episode_start[:, None].astype(bool), jnp.zeros_like(x), x), carry
+            )
             carry, x = self.lstm(carry, x)
             return carry, x
 
@@ -279,7 +278,7 @@ if __name__ == "__main__":
                 obs, state, lstm_carry, episode_start, key = carry
                 # Reset hidden states
                 lstm_carry = jax.tree.map(
-                    lambda x: jnp.where(episode_start[:, None], 0.0, x).astype(bool), lstm_carry
+                    lambda x: jnp.where(episode_start[:, None].astype(bool), jnp.zeros_like(x), x), lstm_carry
                 )
                 # Keys for action-sampling and env.step
                 key, key_act, key_step = jax.random.split(key, 3)
