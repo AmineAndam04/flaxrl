@@ -44,7 +44,7 @@ class GymnaxInterface(JaxRLEnv):
 
     @property
     def action_size(self):
-        action_space = self.env.action_space
+        action_space = self.action_space
         if isinstance(action_space, gymnax.environments.spaces.Box):
             return action_space.shape[0]
         elif isinstance(action_space, gymnax.environments.spaces.Discrete):
