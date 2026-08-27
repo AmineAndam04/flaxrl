@@ -36,6 +36,9 @@ class VecWrapper(Wrapper):
     def step(self, key, state, action):
         return jax.vmap(fun=self.env.step, in_axes=(0, 0, 0))(key, state, action)
 
+    def sample(self, key):
+        return jax.vmap(fun=self.env.action_space.sample, in_axes=0)(key)
+
 
 ## ------ Time Limit wrapper
 @struct.dataclass
