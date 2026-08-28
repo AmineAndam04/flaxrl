@@ -205,6 +205,8 @@ if __name__ == "__main__":
     eps_scheduler = partial(
         linear_schedule, args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps
     )
+    # polyak
+    polyak_update = partial(polyak_update, tau=args.polyak)
 
     # update_step: step the envs + periodically update the qnetwork
     @nnx.jit
@@ -242,6 +244,7 @@ if __name__ == "__main__":
         buffer = rb_fun.add(buffer, timestep)
 
         # ------ Update the q network ------
+        # TODO Do I need to pass the qnetwork and optimizer as arguments
         def update_qnetwork(qnetwork, optimizer, key_sample):
             # Sample a batch
             batch = rb_fun.sample(buffer, key_sample).experience
@@ -286,10 +289,9 @@ if __name__ == "__main__":
         nnx.cond(
             update_target_qnet_event,
             polyak_update,
-            lambda x, y, z: None,
+            lambda *_: None,
             qnetwork,
             target_qnetwork,
-            args.polyak,
         )
         # ------ Prepare the next updating step ------
         # update rollout_state
