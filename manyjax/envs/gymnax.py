@@ -3,7 +3,7 @@ from typing import Any
 
 import gymnax
 
-from .common import JaxRLEnv
+from .core import JaxRLEnv
 
 
 @dataclass

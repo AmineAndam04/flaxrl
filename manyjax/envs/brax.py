@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from brax import envs
 from gymnax.environments import spaces
 
-from .common import JaxRLEnv
+from .core import JaxRLEnv
 
 
 @dataclass

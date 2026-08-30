@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from gymnax.environments import spaces
 from mujoco_playground import registry
 
-from .common import JaxRLEnv
+from .core import JaxRLEnv
 
 
 @dataclass
