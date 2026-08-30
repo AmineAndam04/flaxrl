@@ -55,7 +55,7 @@ class MPEInterface(JaxMARLEnv):
             avail_actions=avail_actions,
         )
 
-    def reset(self, key) -> tuple[Any, Any]:
+    def reset(self, key):
         obs, env_state = self.env.reset(key)
         obs, mdp_state = self._process_obs(obs)
         return obs, mdp_state, env_state
@@ -70,7 +70,7 @@ class MPEInterface(JaxMARLEnv):
             action = {agent: action[i, : self.action_sizes[i]] for i, agent in enumerate(self.env.agents)}
         obs, env_state, rewards, dones, infos = self.env.step(key=key, state=state, actions=action)
         obs, mdp_state = self._process_obs(obs)
-        infos["__all__"] = dones.get("__all__", None)
+        infos = {**infos, "__all__": dones["__all__"]}
         rewards = self._dict_to_jnp_array(rewards)
         dones = self._dict_to_jnp_array(dones)
         return obs, mdp_state, env_state, rewards, dones, False, infos

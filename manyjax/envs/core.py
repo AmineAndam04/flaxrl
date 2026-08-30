@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
+
+# TODO specify the structure of outputs: -> tuple[Any, Any, Any, Any]
 
 
 class JaxRLEnv(ABC):
@@ -37,7 +40,7 @@ class JaxRLEnv(ABC):
 
 class JaxMARLEnv(ABC):
     @abstractmethod
-    def reset(self, key):
+    def reset(self, key) -> tuple[Any, Any, Any, Any]:
         """Should return: obs, state"""
         pass
 

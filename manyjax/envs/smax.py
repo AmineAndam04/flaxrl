@@ -11,7 +11,7 @@ from .core import JaxMARLEnv
 
 
 @dataclass
-class SMAXnterface(JaxMARLEnv):
+class SMAXInterface(JaxMARLEnv):
     env: Any
     env_name: str
     num_agents: int
@@ -42,7 +42,7 @@ class SMAXnterface(JaxMARLEnv):
             _state_size=_state_size,
         )
 
-    def reset(self, key) -> tuple[Any, Any]:
+    def reset(self, key):
         obs, env_state = self.env.reset(key)
         obs, mdp_state = self._process_obs(obs)
         return obs, mdp_state, env_state
@@ -55,7 +55,7 @@ class SMAXnterface(JaxMARLEnv):
         action = {agent: action[i] for i, agent in enumerate(self.env.agents)}
         obs, env_state, rewards, dones, infos = self.env.step(key=key, state=state, actions=action)
         obs, mdp_state = self._process_obs(obs)
-        infos["__all__"] = dones.get("__all__", None)
+        infos = {**infos, "__all__": dones["__all__"]}
         rewards = self._dict_to_jnp_array(rewards)
         dones = self._dict_to_jnp_array(dones)
         return obs, mdp_state, env_state, rewards, dones, False, infos
@@ -72,7 +72,7 @@ class SMAXnterface(JaxMARLEnv):
         return action
 
     def get_avail_actions(self, state):
-        return self.env.get_avail_actions(state)
+        return self._dict_to_jnp_array(self.env.get_avail_actions(state)).astype(bool)
 
     def _process_obs(self, obs):
         obs_ = jnp.array([obs[agent] for agent in self.env.agents])
