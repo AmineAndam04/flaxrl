@@ -109,5 +109,9 @@ class MPEInterface(JaxMARLEnv):
         return self.longest_action_size
 
     @property
+    def reward_size(self):
+        return (self.num_agents,)
+
+    @property
     def state_size(self):
         return self._state_size

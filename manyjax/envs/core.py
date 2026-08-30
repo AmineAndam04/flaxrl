@@ -68,5 +68,9 @@ class JaxMARLEnv(ABC):
     def state_size(self): ...
 
     @property
+    @abstractmethod
+    def reward_size(self): ...
+
+    @property
     def unwrapped(self):
         return self

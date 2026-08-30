@@ -72,6 +72,7 @@ class SMAXInterface(JaxMARLEnv):
         return action
 
     def get_avail_actions(self, state):
+        # TODO valid only for discrete actions
         return self._dict_to_jnp_array(self.env.get_avail_actions(state)).astype(bool)
 
     def _process_obs(self, obs):
@@ -89,6 +90,10 @@ class SMAXInterface(JaxMARLEnv):
     @property
     def action_size(self):
         return self._action_size
+
+    @property
+    def reward_size(self):
+        return (self.num_agents,)
 
     @property
     def state_size(self):
