@@ -11,23 +11,21 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import tyro
-from flax import nnx
+from envs.make_env import make_marl_env
+from flax import nnx, struct
 from tensorboardX import SummaryWriter
 
-from envs.make_env import make_env
 
-
+# TODO support reward normalization
 @dataclass
 class Args:
     # Environment
-    env_type: str = "gymnax"
+    env_type: str = "smax"
     """ gymnax """
-    env_name: str = "CartPole-v1"
+    env_name: str = "3m"
     """ Discrete envs only """
-    normalize_obs: bool = False
-    """ Normalize the observations if True"""
-    normalize_reward: bool = False
-    """ Normalize the rewards if True"""
+    reward_aggr: str = "mean"
+    """ Aggregate rewards: mean, sum, or none"""
     # Network
     actor_hidden_dim: int = 32
     """ Hidden dimension of actor network"""
@@ -104,13 +102,15 @@ class Actor(nnx.Module):
         )
         self.logits = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray) -> distrax.Categorical:
+    def __call__(self, obs: jnp.ndarray, avail_actions: jnp.ndarray) -> distrax.Categorical:
         logits = self.logits(obs)
+        logits = jnp.where(avail_actions, logits, -1e10)
         pi = distrax.Categorical(logits)
         return pi
 
-    def get_action(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def get_action(self, obs: jnp.ndarray, avail_actions: jnp.ndarray) -> jnp.ndarray:
         logits = self.logits(obs)
+        logits = jnp.where(avail_actions, logits, -1e10)
         return jnp.argmax(logits, axis=-1)
 
 
@@ -138,24 +138,28 @@ class Critic(nnx.Module):
 ## RolloutState contains the necessary information to step the environment
 ## it includes - obs: the current observation, used to take the action
 ##             - env_state: the current state of the environment
+##             - avail_actions: available actions
 ##             - key: to sample actions
 class RolloutState(NamedTuple):
     obs: jax.Array
     env_state: Any
+    avail_actions: jax.Array
     key: jax.Array
 
 
-## EpisodeStats keeps track of the episodic returns and length
-## When an episode is done, we record it is episode length and episodic return
+## EpisodeStats keeps track of the episodic statistics
 class EpisodeStats(NamedTuple):
     episode_return: jax.Array
     episode_length: jax.Array
+    battle_won: jax.Array
+    ep_done: jax.Array
 
 
 ## Transition stores data we need to update the policy and the value function
 class Transition(NamedTuple):
     obs: jax.Array
     action: jax.Array
+    avail_actions: jax.Array
     log_prob: jax.Array
     reward: jax.Array
     done: jax.Array
@@ -164,20 +168,22 @@ class Transition(NamedTuple):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    # Vec training params
-    num_steps = args.num_envs * args.num_steps
-    assert num_steps % args.batch_size == 0, "(args.num_envs * args.num_steps) % args.batch_size != 0"
-    num_batches = num_steps // args.batch_size
-    num_updates = args.total_timesteps // num_steps
     # Rng keys
     key = jax.random.key(args.seed)
     rngs = nnx.Rngs(args.seed)
     key, reset_key, shuffle_key, eval_key = jax.random.split(key, 4)
     # Import the environment
-    env = make_env(args)
-    # Prepare networks
+    env = make_marl_env(args)
     print("env.action_size", env.action_size)
     print("env.observation_size", env.observation_size)
+    print("env.state_size", env.state_size)
+    print("env.reward_size", env.reward_size)
+    # Vec training params
+    num_steps = args.num_envs * args.num_steps
+    assert num_steps % args.batch_size == 0, "(args.num_envs * args.num_steps) % args.batch_size != 0"
+    num_batches = num_steps * env.num_agents // args.batch_size
+    num_updates = args.total_timesteps // num_steps
+    # Prepare networks
     actor = Actor(
         input_dim=env.observation_size,
         hidden_dim=args.actor_hidden_dim,
@@ -203,14 +209,15 @@ if __name__ == "__main__":
     # Logging
     time_token = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_name = f"{args.env_name}__{args.exp_name}__{time_token}"
-    log_dir = f"{args.work_dir}/PPO-{run_name}"
+    log_dir = f"{args.work_dir}/IPPO-{run_name}"
     # Reset the env
     reset_key = jax.random.split(reset_key, args.num_envs)
-    obs, env_state = env.reset(key=reset_key)
+    obs, _, env_state = env.reset(key=reset_key)
+    avail_actions = env.get_avail_actions(env_state)
     # Prepare the rollout state
-    rollout_state = RolloutState(obs=obs, env_state=env_state, key=key)
+    rollout_state = RolloutState(obs=obs, env_state=env_state, avail_actions=avail_actions, key=key)
 
-    # update_step: 1 PPO update = collect num_steps*num_env steps + compute GAE + PPO updates for n_epochs
+    # update_step: 1 IPPO update = collect num_steps*num_env steps + compute GAE + PPO updates for n_epochs
     @nnx.jit
     @nnx.scan(
         length=num_updates,
@@ -228,33 +235,42 @@ if __name__ == "__main__":
             # env_one_step : one step for each environment
             def env_one_step(carry, x):
                 # Last rollout state
-                obs, state, key = carry
+                obs, state, avail_actions, key = carry
                 # Keys for action-sampling and env.step
                 key, key_act, key_step = jax.random.split(key, 3)
                 key_step = jax.random.split(key_step, args.num_envs)
                 # Get action, log_prob and value
-                pi = actor(obs=obs)
+                pi = actor(obs=obs, avail_actions=avail_actions)
                 value = critic(obs=obs)
                 action = pi.sample(seed=key_act)
                 log_prob = pi.log_prob(action)
                 # Step the env
-                next_obs, next_state, reward, terminated, truncated, info = env.step(key_step, state, action)
-                done = jnp.logical_or(terminated, truncated)
+                next_obs, _, next_state, reward, terminated, truncated, info = env.step(
+                    key_step, state, action
+                )
+                next_avail_action = env.get_avail_actions(next_state)
+                done = terminated.astype(bool) | info["__all__"][:, None]
                 # Record its episodic return and length
                 episode_stats = EpisodeStats(
-                    episode_return=info["episode_return"], episode_length=info["episode_length"]
+                    episode_return=info["episode_return"],
+                    episode_length=info["episode_length"],
+                    battle_won=reward >= 1,
+                    ep_done=info["__all__"],
                 )
                 # Store date needed for training
                 transition = Transition(
                     obs=obs,
                     action=action,
+                    avail_actions=avail_actions,
                     log_prob=log_prob,
                     reward=reward,
                     done=done,
                     value=value,
                 )
                 # Prepare the next rollout_state
-                rollout_state = RolloutState(obs=next_obs, env_state=next_state, key=key)
+                rollout_state = RolloutState(
+                    obs=next_obs, env_state=next_state, avail_actions=next_avail_action, key=key
+                )
                 return rollout_state, (transition, episode_stats)
 
             # Step the envs
@@ -306,8 +322,8 @@ if __name__ == "__main__":
                 actor, actor_optimizer, critic, critic_optimizer = carry
 
                 # ppo_actor_loss: actor loss
-                def ppo_actor_loss(actor, b_obs, b_action, b_log_probs, b_adv):
-                    pi = actor(obs=b_obs)
+                def ppo_actor_loss(actor, b_obs, b_action, b_avail_actions, b_log_probs, b_adv):
+                    pi = actor(obs=b_obs, avail_actions=b_avail_actions)
                     b_new_log_prob = pi.log_prob(b_action)
                     ratio = jnp.exp(b_new_log_prob - b_log_probs)
                     pg_loss1 = -b_adv * ratio
@@ -328,6 +344,7 @@ if __name__ == "__main__":
                     actor,
                     batch_transition.obs,
                     batch_transition.action,
+                    batch_transition.avail_actions,
                     batch_transition.log_prob,
                     batch_advantages,
                 )
@@ -350,12 +367,12 @@ if __name__ == "__main__":
             losses = jax.tree.map(lambda x: x.mean(), losses)
             return (actor, actor_optimizer, critic, critic_optimizer), losses
 
-        # Prepare the training batch: reshape to (num_steps,**) + shuffle +
-        #  reshape to (number_of_possible_batches,batch_size,**)
+        # Prepare the training batch:
+        # (args.num_steps,num_envs,num_agents, ***) to (args.num_steps* num_envs*num_agents, ***)
         batches = (transitions, advantages, returns)
-        batches = jax.tree.map(lambda x: jax.lax.collapse(x, 0, 2), batches)
+        batches = jax.tree.map(lambda x: jax.lax.collapse(x, 0, 3), batches)
         shuffle_key, permutation_key = jax.random.split(shuffle_key)
-        permutation = jax.random.permutation(permutation_key, num_steps)
+        permutation = jax.random.permutation(permutation_key, num_steps * env.num_agents)
         batches = jax.tree.map(lambda x: x[permutation], batches)
         batches = jax.tree.map(lambda x: x.reshape((num_batches, args.batch_size) + x.shape[1:]), batches)
         # Train for n_epochs
@@ -364,7 +381,13 @@ if __name__ == "__main__":
         )
         update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key
         losses = jax.tree.map(lambda x: x.mean(), losses)
-        metrics = *losses, transitions.done, episode_stats.episode_return, episode_stats.episode_length
+        metrics = (
+            *losses,
+            episode_stats.episode_return,
+            episode_stats.episode_length,
+            episode_stats.battle_won,
+            episode_stats.ep_done,
+        )
         return update_state, metrics
 
     # Train
@@ -375,17 +398,28 @@ if __name__ == "__main__":
     if args.eval:
         # Create eval env
         actor, _, _, _, rollout_state, _ = update_state
-        eval_env = make_env(args, eval=True, rollout_state=rollout_state)
+        eval_env = make_marl_env(args)
         # Reset eval_env
         eval_key, reset_key = jax.random.split(eval_key)
         reset_key = jax.random.split(reset_key, args.num_eval_ep)
-        obs, env_state = eval_env.reset(reset_key)
+        obs, _, env_state = eval_env.reset(reset_key)
+        avail_actions = eval_env.get_avail_actions(env_state)
         # Initialize metrics
         eval_ep_returns = jnp.zeros(args.num_eval_ep)
         eval_ep_lengths = jnp.zeros(args.num_eval_ep, dtype=jnp.int32)
         ep_dones = jnp.zeros(args.num_eval_ep, dtype=jnp.bool_)
-
-        evaluation_state = (obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key)
+        if args.env_type == "smax":
+            eval_ep_battle_win = jnp.zeros(args.num_eval_ep, dtype=bool)
+        evaluation_state = (
+            obs,
+            avail_actions,
+            env_state,
+            eval_ep_returns,
+            eval_ep_battle_win,
+            eval_ep_lengths,
+            ep_dones,
+            eval_key,
+        )
 
         # Stops once all envs are done
         def cond_fun(evaluation_state):
@@ -393,21 +427,40 @@ if __name__ == "__main__":
 
         # Step the eval envs
         def eval_fun(evaluation_state):
-            obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key = evaluation_state
+            (
+                obs,
+                avail_actions,
+                env_state,
+                eval_ep_returns,
+                eval_ep_battle_win,
+                eval_ep_lengths,
+                ep_dones,
+                eval_key,
+            ) = evaluation_state
             eval_key, key_step = jax.random.split(eval_key)
             key_step = jax.random.split(key_step, args.num_eval_ep)
-            action = actor.get_action(obs)
-            next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(
-                key_step, env_state, action
-            )
+            action = actor.get_action(obs, avail_actions=avail_actions)
+            next_obs, _, next_state, reward, _, _, infos = eval_env.step(key_step, env_state, action)
+            avail_actions = eval_env.get_avail_actions(next_state)
+            reward = jnp.mean(reward, axis=-1)
             active = ~ep_dones.astype(bool)
             eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
             eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
-            ep_dones = ep_dones.astype(bool) | terminated.astype(bool) | truncated.astype(bool)
-            return next_obs, next_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key
+            ep_dones = ep_dones.astype(bool) | infos["__all__"].astype(bool)
+            eval_ep_battle_win += (reward >= 1) & active & infos["__all__"].astype(bool)
+            return (
+                next_obs,
+                avail_actions,
+                next_state,
+                eval_ep_returns,
+                eval_ep_battle_win,
+                eval_ep_lengths,
+                ep_dones,
+                eval_key,
+            )
 
         # Evaluation loop
-        _, _, eval_ep_returns, eval_ep_lengths, ep_dones, _ = jax.lax.while_loop(
+        _, _, _, eval_ep_returns, eval_ep_battle_win, eval_ep_lengths, ep_dones, _ = jax.lax.while_loop(
             cond_fun=cond_fun, body_fun=eval_fun, init_val=evaluation_state
         )
         # Display the results
@@ -419,22 +472,33 @@ if __name__ == "__main__":
         print(f"Evaluation over {args.num_eval_ep} episodes")
         print(f"Return: {mean_return:.2f} ± {std_return:.2f}")
         print(f"Episode length: {mean_length:.1f} ± {std_length:.1f}")
+        if args.env_type == "smax":
+            mean_battle_won = float(eval_ep_battle_win.mean())
+            std_battle_won = float(eval_ep_battle_win.std())
+            print(f"Battle won: {mean_battle_won:.2f} ± {std_battle_won:.2f}")
     # tensorboard logging
     if args.log:
         metrics = jax.device_get(metrics)
-        actor_losses, entropies, critic_losses, dones, episode_returns, episode_lengths = metrics
-        dones = dones.reshape(-1)
-        episode_returns = episode_returns.reshape(-1)
-        episode_lengths = episode_lengths.reshape(-1)
+        actor_losses, entropies, critic_losses, episode_returns, episode_lengths, battle_win, ep_dones = (
+            metrics
+        )
+        ep_dones = ep_dones.squeeze().reshape(-1)
+        episode_returns = jnp.mean(episode_returns, axis=-1).reshape(-1)
+        if args.env_type == "smax":
+            battle_win = jnp.mean(battle_win, axis=-1).reshape(-1)
+        episode_lengths = episode_lengths[:, :, :, 0].reshape(-1)
         writer = SummaryWriter(log_dir)
-        completed_steps = np.flatnonzero(dones)
+        completed_steps = np.flatnonzero(ep_dones)
         for start in range(0, len(completed_steps), args.log_every):
             episode_steps = completed_steps[start : start + args.log_every]
             step = int(episode_steps[-1]) + 1
             mean_episode_return = episode_returns[episode_steps].mean()
+            mean_battle_won = battle_win[episode_steps].mean()
             mean_episode_length = episode_lengths[episode_steps].mean()
             writer.add_scalar("rollout/ep_reward", float(mean_episode_return), step)
             writer.add_scalar("rollout/ep_length", float(mean_episode_length), step)
+            if args.env_type == "smax":
+                writer.add_scalar("rollout/battle_won", float(mean_battle_won), step)
         for update in range(0, num_updates, args.log_every):
             step = (update + 1) * args.num_steps * args.num_envs
             writer.add_scalar("losses/actor_loss", float(actor_losses[update]), step)

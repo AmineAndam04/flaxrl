@@ -1,16 +1,17 @@
 """A func to prepare the environment"""
 
+from .mwrappers import RecordVecMARLEpisodeStatistics, RewardAggregatorWrapper, VecMARLWrapper
 from .wrappers import (
     AutoResetWrapper,
     ClipAction,
     NormalizeVecObservation,
     NormalizeVecObservationEval,
+    NormalizeVecObservationState,
     NormalizeVecReward,
     RecordVecEpisodeStatistics,
     TimeLimit,
     VecWrapper,
 )
-from .wrappers import NormalizeVecObservationState
 
 
 def make_env(args, eval=False, rollout_state=None):
@@ -65,6 +66,26 @@ def make_env(args, eval=False, rollout_state=None):
             raise ValueError("Provide the rollout_state")
     if args.normalize_reward and not eval:
         env = NormalizeVecReward(env, gamma=args.gamma)
+    return env
+
+
+def make_marl_env(args):
+    """
+    A func to prepare marl environments
+    params: args: the args from training
+
+    """
+    if args.env_type == "mpe":
+        from .mpe import MPEInterface
+
+        env = MPEInterface.make(args.env_name)
+    elif args.env_type == "smax":
+        from .smax import SMAXInterface
+
+        env = SMAXInterface.make(args.env_name)
+    env = VecMARLWrapper(env)
+    env = RewardAggregatorWrapper(env=env, reward_aggr=args.reward_aggr)
+    env = RecordVecMARLEpisodeStatistics(env)
     return env
 
 

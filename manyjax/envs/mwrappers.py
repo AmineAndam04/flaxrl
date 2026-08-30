@@ -49,7 +49,7 @@ class RecordVecEpisodeStatisticsState:
     episode_length: jax.Array
 
 
-class RecordVecEpisodeStatistics(Wrapper):
+class RecordVecMARLEpisodeStatistics(Wrapper):
     def reset(self, key):
         obs, mdp_state, env_state = self.env.reset(key)
         # start recording
@@ -97,16 +97,16 @@ class RewardAggregatorWrapper(Wrapper):
     def step(self, key, state, action):
         obs, mdp_state, env_state, rewards, dones, truncated, infos = self.env.step(key, state, action)
         if self.reward_aggr == "mean":
-            rewards = jnp.mean(rewards, axis=-1)
-            dones = infos["__all__"]
+            rewards = jnp.mean(rewards, axis=-1, keepdims=True)
+            dones = jnp.expand_dims(infos["__all__"], axis=1)
         elif self.reward_aggr == "sum":
-            rewards = jnp.sum(rewards, axis=-1)
-            dones = infos["__all__"]
+            rewards = jnp.sum(rewards, axis=-1, keepdims=True)
+            dones = jnp.expand_dims(infos["__all__"], axis=1)
         return obs, mdp_state, env_state, rewards, dones, truncated, infos
 
     @property
     def reward_size(self):
         if self.reward_aggr in ("mean", "sum"):
-            return ()
+            return (1,)
         else:
             return (self.env.num_agents,)

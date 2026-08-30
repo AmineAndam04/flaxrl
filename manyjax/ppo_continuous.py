@@ -223,7 +223,7 @@ if __name__ == "__main__":
     rollout_state = RolloutState(obs=obs, env_state=env_state, key=key)
 
     # update_step: 1 PPO update = collect num_steps*num_env steps + compute GAE + PPO updates for n_epochs
-    @nnx.jit  # The first argument is also the first return
+    @nnx.jit
     @nnx.scan(
         length=num_updates,
         in_axes=(nnx.Carry, None),
