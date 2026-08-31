@@ -432,7 +432,7 @@ def train(args):  # noqa: PLR0915
         )
         return update_state, metrics
 
-    # Train
+    # ------ Run SAC ------
     update_state = (
         actor,
         actor_optimizer,
@@ -447,12 +447,11 @@ def train(args):  # noqa: PLR0915
     start_time = time.perf_counter()
     update_state, metrics = update_step(update_state, None)
     jax.block_until_ready(metrics)
-    jax.block_until_ready(metrics)
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
     actor, _, critic, _, _, _, _, rollout_state, _ = update_state
-    # Evaluate
+    # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
         evaluate(args, actor, rollout_state, eval_key)
     if args.log:

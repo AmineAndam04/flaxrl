@@ -368,7 +368,6 @@ def train(args):
     if args.log:
         tb_logger(args, metrics, log_dir, num_updates)
     if args.save_model:
-        actor, _, critic, _, _, _ = update_state
         _, actor_state = nnx.split(actor)
         _, critic_state = nnx.split(critic)
         network_states = {"actor": actor_state, "critic": critic_state}

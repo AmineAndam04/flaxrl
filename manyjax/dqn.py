@@ -1,5 +1,6 @@
 import datetime
 import json
+import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -12,10 +13,9 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import tyro
+from envs.make_env import make_env
 from flax import nnx
 from tensorboardX import SummaryWriter
-
-from envs.make_env import make_env
 
 
 @dataclass
@@ -84,6 +84,7 @@ class Args:
     """ Number of evaluation episodes"""
 
 
+# -------- Actor and critic nets --------
 class Qnetwork(nnx.Module):
     def __init__(
         self,
@@ -104,12 +105,10 @@ class Qnetwork(nnx.Module):
         return self.qnet(obs)
 
 
-# States
-## RolloutState contains the necessary information to step the environment
-## it includes - obs: the current observation, used to take the action
-##             - env_state: the current state of the environment
-##             - key: to sample actions
+# -------- States --------
 class RolloutState(NamedTuple):
+    """The necessary information to step the environment"""
+
     obs: jax.Array
     env_state: Any
     step: int
@@ -117,40 +116,22 @@ class RolloutState(NamedTuple):
 
 
 class TimeStep(NamedTuple):
+    """the transition saved to the replay buffer"""
+
     obs: jax.Array
     action: jax.Array
     reward: jax.Array
     done: jax.Array
 
 
-## EpisodeStats keeps track of the episodic returns and length
-## When an episode is done, we record it is episode length and episodic return
 class EpisodeStats(NamedTuple):
+    """Episodic statistics"""
+
     episode_return: jax.Array
     episode_length: jax.Array
 
 
-# linear_schedule: used for exploration
-def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
-    slope = (end_e - start_e) / duration
-    return jnp.clip(slope * t + start_e, end_e)
-
-
-# polyak_update
-def polyak_update(network, target_network, tau):
-    params = nnx.state(network, nnx.Param)
-    target_params = nnx.state(target_network, nnx.Param)
-
-    updated_params = jax.tree.map(
-        lambda target, online: (1.0 - tau) * target + tau * online,
-        target_params,
-        params,
-    )
-    nnx.update(target_network, updated_params)
-
-
-if __name__ == "__main__":
-    args = tyro.cli(Args)
+def train(args):
     # Vec training params
     num_updates = args.total_timesteps // args.num_envs
     assert args.train_freq % args.num_envs == 0, "args.train_freq % args.num_envs != 0"
@@ -160,9 +141,7 @@ if __name__ == "__main__":
     key, reset_key, eval_key = jax.random.split(key, 3)
     # Import the environment
     env = make_env(args)
-    # Prepare networks
-    print("env.action_size", env.action_size)
-    print("env.observation_size", env.observation_size)
+    # Prepare networks + optimizer
     qnetwork = Qnetwork(
         input_dim=env.observation_size,
         hidden_dim=args.hidden_dim,
@@ -171,7 +150,6 @@ if __name__ == "__main__":
         rngs=rngs,
     )
     target_qnetwork = nnx.clone(qnetwork)
-    # Optimizers
     optim = getattr(optax, args.optimizer)
     optimizer = optim(learning_rate=args.learning_rate)
     if args.clip_gradients > 0:
@@ -201,12 +179,11 @@ if __name__ == "__main__":
     )
     # Prepare the rollout state
     rollout_state = RolloutState(obs=obs, env_state=env_state, step=0, key=key)
-    # Eps scheduler
+    # Eps scheduler + polyak
     eps_scheduler = partial(
-        linear_schedule, args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps
+        linear_schedule_, args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps
     )
-    # polyak
-    polyak_update = partial(polyak_update, tau=args.polyak)
+    polyak_update = partial(polyak_update_, tau=args.polyak)
 
     # update_step: step the envs + periodically update the qnetwork
     @nnx.jit
@@ -244,7 +221,6 @@ if __name__ == "__main__":
         buffer = rb_fun.add(buffer, timestep)
 
         # ------ Update the q network ------
-        # TODO Do I need to pass the qnetwork and optimizer as arguments
         def update_qnetwork(qnetwork, optimizer, key_sample):
             # Sample a batch
             batch = rb_fun.sample(buffer, key_sample).experience
@@ -301,87 +277,20 @@ if __name__ == "__main__":
         metrics = loss, update_event, done, episode_stats.episode_return, episode_stats.episode_length, eps
         return update_state, metrics
 
-    # Train
+    # ------ Run DQN ------
     update_state = qnetwork, optimizer, target_qnetwork, rollout_state, buffer
+    start_time = time.perf_counter()
     update_state, metrics = update_step(update_state, None)
     jax.block_until_ready(metrics)
-    # Evaluate
+    end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
+    print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
+    qnetwork, _, _, rollout_state, _ = update_state
+    # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
-        # Create eval env
-        qnetwork, _, _, rollout_state, _ = update_state
-        eval_env = make_env(args, eval=True, rollout_state=rollout_state)
-        # Reset eval_env
-        eval_key, reset_key = jax.random.split(eval_key)
-        reset_key = jax.random.split(reset_key, args.num_eval_ep)
-        obs, env_state = eval_env.reset(reset_key)
-        # Initialize metrics
-        eval_ep_returns = jnp.zeros(args.num_eval_ep)
-        eval_ep_lengths = jnp.zeros(args.num_eval_ep, dtype=jnp.int32)
-        ep_dones = jnp.zeros(args.num_eval_ep, dtype=jnp.bool_)
-        # Eval state
-        evaluation_state = (obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key)
-
-        # Stops once all envs are done
-        def cond_fun(evaluation_state):
-            return ~jnp.all(evaluation_state[-2])
-
-        # Step the eval envs
-        def eval_fun(evaluation_state):
-            obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key = evaluation_state
-            eval_key, key_step = jax.random.split(eval_key)
-            key_step = jax.random.split(key_step, args.num_eval_ep)
-            q_vals = qnetwork(obs=obs)
-            action = jnp.argmax(q_vals, axis=-1)
-            next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(
-                key_step, env_state, action
-            )
-            active = ~ep_dones.astype(bool)
-            eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
-            eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
-            ep_dones = ep_dones.astype(bool) | terminated.astype(bool) | truncated.astype(bool)
-            return next_obs, next_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key
-
-        # Evaluation loop
-        _, _, eval_ep_returns, eval_ep_lengths, ep_dones, _ = jax.lax.while_loop(
-            cond_fun=cond_fun, body_fun=eval_fun, init_val=evaluation_state
-        )
-        # Display the results
-        eval_ep_returns, eval_ep_lengths = jax.device_get((eval_ep_returns, eval_ep_lengths))
-        mean_return = float(eval_ep_returns.mean())
-        std_return = float(eval_ep_returns.std())
-        mean_length = float(eval_ep_lengths.mean())
-        std_length = float(eval_ep_lengths.std())
-        print(f"Evaluation over {args.num_eval_ep} episodes")
-        print(f"Return: {mean_return:.2f} ± {std_return:.2f}")
-        print(f"Episode length: {mean_length:.1f} ± {std_length:.1f}")
-    # tensorboard logging
+        evaluate(args, qnetwork, rollout_state, eval_key)
     if args.log:
-        metrics = jax.device_get(metrics)
-        losses, update_events, dones, episode_returns, episode_lengths, epses = metrics
-        losses = losses.reshape(-1)
-        epses = epses.reshape(-1)
-        update_events = update_events.reshape(-1)
-        dones = dones.reshape(-1)
-        episode_returns = episode_returns.reshape(-1)
-        episode_lengths = episode_lengths.reshape(-1)
-        writer = SummaryWriter(log_dir)
-        completed_steps = np.flatnonzero(dones)
-        for start in range(0, len(completed_steps), args.log_every):
-            episode_steps = completed_steps[start : start + args.log_every]
-            step = int(episode_steps[-1]) + 1
-            mean_episode_return = episode_returns[episode_steps].mean()
-            mean_episode_length = episode_lengths[episode_steps].mean()
-            writer.add_scalar("rollout/ep_reward", float(mean_episode_return), step)
-            writer.add_scalar("rollout/ep_length", float(mean_episode_length), step)
-        updates_steps = np.flatnonzero(update_events)
-        for start in range(0, len(updates_steps), args.log_every):
-            train_steps = updates_steps[start : start + args.log_every]
-            step = (int(train_steps[-1]) + 1) * args.num_envs
-            loss = losses[train_steps].mean()
-            writer.add_scalar("losses/q_loss", float(loss), step)
-            writer.add_scalar("rollout/eps", float(epses[start]), step)
-        writer.close()
-    # Save the weights
+        tb_logger(args, metrics, log_dir)
     if args.save_model:
         qnetwork, *_ = update_state
         _, qnetwork_state = nnx.split(qnetwork)
@@ -392,3 +301,95 @@ if __name__ == "__main__":
         print(f"Networks saved to {checkpoint_path}")
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
+
+
+def evaluate(args, qnetwork, rollout_state, eval_key):
+    eval_env = make_env(args, eval=True, rollout_state=rollout_state)
+    eval_key, reset_key = jax.random.split(eval_key)
+    reset_key = jax.random.split(reset_key, args.num_eval_ep)
+    obs, env_state = eval_env.reset(reset_key)
+    # Initialize metrics
+    eval_ep_returns = jnp.zeros(args.num_eval_ep)
+    eval_ep_lengths = jnp.zeros(args.num_eval_ep, dtype=jnp.int32)
+    ep_dones = jnp.zeros(args.num_eval_ep, dtype=jnp.bool_)
+    evaluation_state = (obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key)
+
+    # Stops once all envs are done
+    def cond_fun(evaluation_state):
+        return ~jnp.all(evaluation_state[-2])
+
+    # Step the eval envs
+    def eval_fun(evaluation_state):
+        obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key = evaluation_state
+        eval_key, key_step = jax.random.split(eval_key)
+        key_step = jax.random.split(key_step, args.num_eval_ep)
+        q_vals = qnetwork(obs=obs)
+        action = jnp.argmax(q_vals, axis=-1)
+        next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(key_step, env_state, action)
+        active = ~ep_dones.astype(bool)
+        eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
+        eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
+        ep_dones = ep_dones.astype(bool) | terminated.astype(bool) | truncated.astype(bool)
+        return next_obs, next_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key
+
+    # Evaluation loop
+    _, _, eval_ep_returns, eval_ep_lengths, ep_dones, _ = jax.lax.while_loop(
+        cond_fun=cond_fun, body_fun=eval_fun, init_val=evaluation_state
+    )
+    # Display the results
+    eval_ep_returns, eval_ep_lengths = jax.device_get((eval_ep_returns, eval_ep_lengths))
+    mean_return = float(eval_ep_returns.mean())
+    std_return = float(eval_ep_returns.std())
+    mean_length = float(eval_ep_lengths.mean())
+    std_length = float(eval_ep_lengths.std())
+    print(f"Evaluation over {args.num_eval_ep} episodes")
+    print(f"Return: {mean_return:.2f} ± {std_return:.2f}")
+    print(f"Episode length: {mean_length:.1f} ± {std_length:.1f}")
+
+
+def tb_logger(args, metrics, log_dir):
+    metrics = jax.device_get(metrics)
+    losses, update_events, dones, episode_returns, episode_lengths, epses = metrics
+    losses = losses.reshape(-1)
+    epses = epses.reshape(-1)
+    update_events = update_events.reshape(-1)
+    dones = dones.reshape(-1)
+    episode_returns = episode_returns.reshape(-1)
+    episode_lengths = episode_lengths.reshape(-1)
+    writer = SummaryWriter(log_dir)
+    completed_steps = np.flatnonzero(dones)
+    for start in range(0, len(completed_steps), args.log_every):
+        episode_steps = completed_steps[start : start + args.log_every]
+        step = int(episode_steps[-1]) + 1
+        mean_episode_return = episode_returns[episode_steps].mean()
+        mean_episode_length = episode_lengths[episode_steps].mean()
+        writer.add_scalar("rollout/ep_reward", float(mean_episode_return), step)
+        writer.add_scalar("rollout/ep_length", float(mean_episode_length), step)
+    updates_steps = np.flatnonzero(update_events)
+    for start in range(0, len(updates_steps), args.log_every):
+        train_steps = updates_steps[start : start + args.log_every]
+        step = (int(train_steps[-1]) + 1) * args.num_envs
+        loss = losses[train_steps].mean()
+        writer.add_scalar("losses/q_loss", float(loss), step)
+        writer.add_scalar("rollout/eps", float(epses[start]), step)
+    writer.close()
+
+
+def linear_schedule_(start_e: float, end_e: float, duration: int, t: int):
+    slope = (end_e - start_e) / duration
+    return jnp.clip(slope * t + start_e, end_e)
+
+
+# polyak_update
+def polyak_update_(network, target_network, tau):
+    params = nnx.state(network, nnx.Param)
+    target_params = nnx.state(target_network, nnx.Param)
+
+    updated_params = jax.tree.map(
+        lambda target, online: (1.0 - tau) * target + tau * online, target_params, params
+    )
+    nnx.update(target_network, updated_params)
+
+
+if __name__ == "__main__":
+    train(tyro.cli(Args))
