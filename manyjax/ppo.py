@@ -145,7 +145,7 @@ class RolloutState(NamedTuple):
 
 
 class EpisodeStats(NamedTuple):
-    """Episodic statistics."""
+    """Episodic statistics"""
 
     episode_return: jax.Array
     episode_length: jax.Array
@@ -205,7 +205,7 @@ def train(args):
     obs, env_state = env.reset(key=reset_key)
     rollout_state = RolloutState(obs=obs, env_state=env_state, key=key)
 
-    # update_step: 1 PPO update = collect num_steps*num_env steps + compute GAE + PPO updates for n_epochs
+    # update_step: 1 PPO update = collect args.num_steps*num_env steps + compute GAE + PPO updates for n_epochs
     @nnx.jit
     @nnx.scan(
         length=num_updates,
@@ -256,7 +256,6 @@ def train(args):
             rollout_state, (transitions, episode_stats) = jax.lax.scan(
                 f=env_one_step, init=rollout_state, xs=None, length=args.num_steps
             )
-
             return rollout_state, transitions, episode_stats
 
         rollout_state, transitions, episode_stats = collect_rollout(actor, critic, rollout_state)
@@ -369,12 +368,8 @@ def train(args):
     # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
         evaluate(args, actor, rollout_state, eval_key)
-        # Create eval env
-
-    # tensorboard logging
     if args.log:
         tb_logger(args, metrics, log_dir, num_updates)
-
     if args.save_model:
         _, actor_state = nnx.split(actor)
         _, critic_state = nnx.split(critic)

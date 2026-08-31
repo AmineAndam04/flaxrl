@@ -1,5 +1,6 @@
 import datetime
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -11,10 +12,9 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import tyro
+from envs.make_env import make_env
 from flax import nnx
 from tensorboardX import SummaryWriter
-
-from envs.make_env import make_env
 
 
 @dataclass
@@ -93,6 +93,7 @@ class Args:
     """ Number of evaluation episodes"""
 
 
+# -------- Actor and critic nets --------
 class Actor(nnx.Module):
     def __init__(
         self,
@@ -175,12 +176,10 @@ class Critic(nnx.Module):
         return self.critic(obs).squeeze(-1)
 
 
-# States
-## RolloutState contains the necessary information to step the environment
-## it includes - obs: the current observation, used to take the action
-##             - env_state: the current state of the environment
-##             - key: to sample actions
+# -------- States --------
 class RolloutState(NamedTuple):
+    """The necessary information to step the environment"""
+
     obs: jax.Array
     env_state: Any
     lstm_carry: Any
@@ -188,15 +187,16 @@ class RolloutState(NamedTuple):
     key: jax.Array
 
 
-## EpisodeStats keeps track of the episodic returns and length
-## When an episode is done, we record it is episode length and episodic return
 class EpisodeStats(NamedTuple):
+    """Episodic statistics"""
+
     episode_return: jax.Array
     episode_length: jax.Array
 
 
-## Transition stores data we need to update the policy and the value function
 class Transition(NamedTuple):
+    """Transitions to update networks"""
+
     obs: jax.Array
     action: jax.Array
     log_prob: jax.Array
@@ -206,8 +206,7 @@ class Transition(NamedTuple):
     episode_start: jax.Array
 
 
-if __name__ == "__main__":
-    args = tyro.cli(Args)
+def train(args):
     # Vec training params
     num_steps = args.num_envs * args.num_steps
     assert args.num_envs % args.batch_size == 0, "args.num_envs % args.batch_size != 0"
@@ -219,7 +218,7 @@ if __name__ == "__main__":
     key, reset_key, shuffle_key, eval_key = jax.random.split(key, 4)
     # Import the environment
     env = make_env(args)
-    # Prepare networks
+    # Prepare networks + optimizes
     actor = Actor(
         input_dim=env.observation_size,
         hidden_dim=args.actor_hidden_dim,
@@ -233,7 +232,6 @@ if __name__ == "__main__":
         num_layers=args.critic_num_layers,
         rngs=rngs,
     )
-    # Optimizers
     optim = getattr(optax, args.optimizer)
     actor_optimizer = optim(learning_rate=args.learning_rate_actor)
     critic_optimizer = optim(learning_rate=args.learning_rate_critic)
@@ -249,14 +247,15 @@ if __name__ == "__main__":
     # Reset the env
     reset_key = jax.random.split(reset_key, args.num_envs)
     obs, env_state = env.reset(key=reset_key)
-    # Prepare the rollout state
+    #! Initialize LSTM Hidden state
+    # its shape is the input shape except the sequence dimension. The best example is in the docstring og flax.linen.scan
     lstm_carry = actor.initialize_carry(args.num_envs, args.actor_hidden_dim)
     episode_start = jnp.zeros(args.num_envs).astype(bool)
     rollout_state = RolloutState(
         obs=obs, env_state=env_state, lstm_carry=lstm_carry, episode_start=episode_start, key=key
     )
 
-    # update_step: 1 PPO update = collect num_steps*num_env steps + compute GAE + PPO updates for n_epochs
+    # update_step: 1 PPO update = collect args.num_steps*num_env steps + compute GAE + PPO updates for n_epochs
     @nnx.jit
     @nnx.scan(
         length=num_updates,
@@ -268,7 +267,7 @@ if __name__ == "__main__":
         actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key = update_state
         initial_lstm_carry = rollout_state.lstm_carry
 
-        # collect_rollout: collect env steps
+        # ------ Collect env steps ------
         def collect_rollout(
             actor: nnx.Module, critic: nnx.Module, rollout_state: RolloutState
         ) -> tuple[RolloutState, Transition, EpisodeStats]:
@@ -311,20 +310,17 @@ if __name__ == "__main__":
                 )
                 return rollout_state, (transition, episode_stats)
 
-            # Step the envs
             rollout_state, (transitions, episode_stats) = jax.lax.scan(
                 f=env_one_step, init=rollout_state, xs=None, length=args.num_steps
             )
-
             return rollout_state, transitions, episode_stats
 
-        # Collect env steps
         rollout_state, transitions, episode_stats = collect_rollout(actor, critic, rollout_state)
 
+        # ------ Compute GAE advantages and returns ------
         # Compute the value of the last steps
         next_value = critic(obs=rollout_state.obs)
 
-        # compute_advantage_and_return: Compute advantages and returns
         def compute_advantage_and_return(
             transition: Transition, next_value: jax.Array
         ) -> tuple[jax.Array, jax.Array]:
@@ -342,12 +338,11 @@ if __name__ == "__main__":
             )
             return advantages, advantages + transition.value
 
-        # Compute the advantages
         advantages, returns = compute_advantage_and_return(transition=transitions, next_value=next_value)
-        # Normalize advantage
         if args.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # ------ Update the networks ------
         # ppo_epochs: run PPO updates for args.n_epochs epochs
         # @nnx.jit(donate_argnums=(0,))
         @nnx.scan(length=args.n_epochs, in_axes=(nnx.Carry, None), out_axes=(nnx.Carry, 0))
@@ -360,7 +355,6 @@ if __name__ == "__main__":
                 batch_transition, batch_advantages, batch_returns, lstm_carry = batch
                 actor, actor_optimizer, critic, critic_optimizer = carry
 
-                # ppo_actor_loss: actor loss
                 def ppo_actor_loss(actor, b_obs, b_action, b_log_probs, b_adv, lstm_carry, b_episode_start):
                     pi = actor.sequence(carry=lstm_carry, obs=b_obs, episode_start=b_episode_start)
                     b_new_log_prob = pi.log_prob(b_action)
@@ -372,7 +366,6 @@ if __name__ == "__main__":
                     ac_loss = pg_loss - args.entropy_coef * entropy
                     return ac_loss, entropy
 
-                # ppo_critic_loss: critic loss
                 def ppo_critic_loss(critic, b_obs, b_returns):
                     values = critic(obs=b_obs)
                     cr_loss = optax.l2_loss(values, b_returns).mean()
@@ -399,7 +392,6 @@ if __name__ == "__main__":
                 carry = (actor, actor_optimizer, critic, critic_optimizer)
                 return carry, (ac_loss, entropy, cr_loss)
 
-            # Update the policy and value function
             (actor, actor_optimizer, critic, critic_optimizer), losses = ppo_batch(
                 (actor, actor_optimizer, critic, critic_optimizer),
                 batches,
@@ -407,8 +399,9 @@ if __name__ == "__main__":
             losses = jax.tree.map(lambda x: x.mean(), losses)
             return (actor, actor_optimizer, critic, critic_optimizer), losses
 
-        # We batch over episodes: consume batch_size env each mini-batch update
-        # From (num_steps, num_envs,**) to (num_steps,batch_size, num_envs// batch_size, **)
+        # ------ Prepare training batches ------
+        # We batch over episodes: consume 'batch_size' env every mini-batch update
+        # From (args.num_steps, num_envs,**) to (args.num_steps,batch_size, num_envs// batch_size, **)
         # We then switch the first two dims
         transitions, advantages, returns = jax.tree.map(
             lambda x: jnp.swapaxes(
@@ -416,7 +409,7 @@ if __name__ == "__main__":
             ),
             (transitions, advantages, returns),
         )
-        # Do the same for the initial lstm
+        # We Do the same for the initial lstm
         initial_lstm_carry = jax.tree.map(
             lambda x: x.reshape(num_batches, args.batch_size, x.shape[-1]),
             initial_lstm_carry,
@@ -431,94 +424,21 @@ if __name__ == "__main__":
         metrics = *losses, transitions.done, episode_stats.episode_return, episode_stats.episode_length
         return update_state, metrics
 
-    # Train
+    # ------ Run PPO ------
     update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key
+    start_time = time.perf_counter()
     update_state, metrics = update_step(update_state, None)
     jax.block_until_ready(metrics)
-    # Evaluate
+    end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
+    print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
+    actor, _, critic, _, rollout_state, _ = update_state
+    # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
-        # Create eval env
-        actor, _, _, _, rollout_state, _ = update_state
-        eval_env = make_env(args, eval=True, rollout_state=rollout_state)
-        # Reset eval_env
-        eval_key, reset_key = jax.random.split(eval_key)
-        reset_key = jax.random.split(reset_key, args.num_eval_ep)
-        obs, env_state = eval_env.reset(reset_key)
-        # Initialize hidden state
-        eval_lstm_carry = actor.lstm.initialize_carry((args.num_eval_ep, args.actor_hidden_dim), rngs=rngs)
-        # Initialize metrics
-        eval_ep_returns = jnp.zeros(args.num_eval_ep)
-        eval_ep_lengths = jnp.zeros(args.num_eval_ep, dtype=jnp.int32)
-        ep_dones = jnp.zeros(args.num_eval_ep, dtype=jnp.bool_)
-
-        evaluation_state = (
-            obs,
-            env_state,
-            eval_ep_returns,
-            eval_ep_lengths,
-            ep_dones,
-            eval_lstm_carry,
-            eval_key,
-        )
-
-        # Stops once all envs are done
-        def cond_fun(evaluation_state):
-            return ~jnp.all(evaluation_state[-3])
-
-        # Step the eval envs
-        def eval_fun(evaluation_state):
-            obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_lstm_carry, eval_key = (
-                evaluation_state
-            )
-            eval_key, key_step = jax.random.split(eval_key)
-            key_step = jax.random.split(key_step, args.num_eval_ep)
-            eval_lstm_carry, action = actor.get_mean(eval_lstm_carry, obs)
-            next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(
-                key_step, env_state, action
-            )
-            active = ~ep_dones.astype(bool)
-            eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
-            eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
-            ep_dones = ep_dones.astype(bool) | terminated.astype(bool) | truncated.astype(bool)
-            return next_obs, next_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_lstm_carry, eval_key
-
-        # Evaluation loop
-        _, _, eval_ep_returns, eval_ep_lengths, ep_dones, *_ = jax.lax.while_loop(
-            cond_fun=cond_fun, body_fun=eval_fun, init_val=evaluation_state
-        )
-        # Display the results
-        eval_ep_returns, eval_ep_lengths = jax.device_get((eval_ep_returns, eval_ep_lengths))
-        mean_return = float(eval_ep_returns.mean())
-        std_return = float(eval_ep_returns.std())
-        mean_length = float(eval_ep_lengths.mean())
-        std_length = float(eval_ep_lengths.std())
-        print(f"Evaluation over {args.num_eval_ep} episodes")
-        print(f"Return: {mean_return:.2f} ± {std_return:.2f}")
-        print(f"Episode length: {mean_length:.1f} ± {std_length:.1f}")
-    # tensorboard logging
+        evaluate(args, actor, rollout_state, eval_key)
     if args.log:
-        metrics = jax.device_get(metrics)
-        actor_losses, entropies, critic_losses, dones, episode_returns, episode_lengths = metrics
-        dones = dones.reshape(-1)
-        episode_returns = episode_returns.reshape(-1)
-        episode_lengths = episode_lengths.reshape(-1)
-        writer = SummaryWriter(log_dir)
-        completed_steps = np.flatnonzero(dones)
-        for start in range(0, len(completed_steps), args.log_every):
-            episode_steps = completed_steps[start : start + args.log_every]
-            step = int(episode_steps[-1]) + 1
-            mean_episode_return = episode_returns[episode_steps].mean()
-            mean_episode_length = episode_lengths[episode_steps].mean()
-            writer.add_scalar("rollout/ep_reward", float(mean_episode_return), step)
-            writer.add_scalar("rollout/ep_length", float(mean_episode_length), step)
-        for update in range(0, num_updates, args.log_every):
-            step = (update + 1) * args.num_steps * args.num_envs
-            writer.add_scalar("losses/actor_loss", float(actor_losses[update]), step)
-            writer.add_scalar("losses/entropy", float(entropies[update]), step)
-            writer.add_scalar("losses/critic_loss", float(critic_losses[update]), step)
-        writer.close()
+        tb_logger(args, metrics, log_dir, num_updates)
     if args.save_model:
-        actor, _, critic, _, _, _ = update_state
         _, actor_state = nnx.split(actor)
         _, critic_state = nnx.split(critic)
         network_states = {"actor": actor_state, "critic": critic_state}
@@ -528,3 +448,78 @@ if __name__ == "__main__":
         print(f"Networks saved to {checkpoint_path}")
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
+
+
+def evaluate(args, actor, rollout_state, eval_key):
+    rngs = nnx.Rngs(args.seed)
+    eval_env = make_env(args, eval=True, rollout_state=rollout_state)
+    eval_key, reset_key = jax.random.split(eval_key)
+    reset_key = jax.random.split(reset_key, args.num_eval_ep)
+    obs, env_state = eval_env.reset(reset_key)
+    # Initialize hidden state
+    eval_lstm_carry = actor.lstm.initialize_carry((args.num_eval_ep, args.actor_hidden_dim), rngs=rngs)
+    # Initialize metrics
+    eval_ep_returns = jnp.zeros(args.num_eval_ep)
+    eval_ep_lengths = jnp.zeros(args.num_eval_ep, dtype=jnp.int32)
+    ep_dones = jnp.zeros(args.num_eval_ep, dtype=jnp.bool_)
+    evaluation_state = (obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_lstm_carry, eval_key)
+
+    # Stops once all envs are done
+    def cond_fun(evaluation_state):
+        return ~jnp.all(evaluation_state[-3])
+
+    # Step the eval envs
+    def eval_fun(evaluation_state):
+        obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_lstm_carry, eval_key = (
+            evaluation_state
+        )
+        eval_key, key_step = jax.random.split(eval_key)
+        key_step = jax.random.split(key_step, args.num_eval_ep)
+        eval_lstm_carry, action = actor.get_mean(eval_lstm_carry, obs)
+        next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(key_step, env_state, action)
+        active = ~ep_dones.astype(bool)
+        eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
+        eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
+        ep_dones = ep_dones.astype(bool) | terminated.astype(bool) | truncated.astype(bool)
+        return next_obs, next_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_lstm_carry, eval_key
+
+    # Evaluation loop
+    _, _, eval_ep_returns, eval_ep_lengths, ep_dones, *_ = jax.lax.while_loop(
+        cond_fun=cond_fun, body_fun=eval_fun, init_val=evaluation_state
+    )
+    # Display the results
+    eval_ep_returns, eval_ep_lengths = jax.device_get((eval_ep_returns, eval_ep_lengths))
+    mean_return = float(eval_ep_returns.mean())
+    std_return = float(eval_ep_returns.std())
+    mean_length = float(eval_ep_lengths.mean())
+    std_length = float(eval_ep_lengths.std())
+    print(f"Evaluation over {args.num_eval_ep} episodes")
+    print(f"Return: {mean_return:.2f} ± {std_return:.2f}")
+    print(f"Episode length: {mean_length:.1f} ± {std_length:.1f}")
+
+
+def tb_logger(args, metrics, log_dir, num_updates):
+    metrics = jax.device_get(metrics)
+    actor_losses, entropies, critic_losses, dones, episode_returns, episode_lengths = metrics
+    dones = dones.reshape(-1)
+    episode_returns = episode_returns.reshape(-1)
+    episode_lengths = episode_lengths.reshape(-1)
+    writer = SummaryWriter(log_dir)
+    completed_steps = np.flatnonzero(dones)
+    for start in range(0, len(completed_steps), args.log_every):
+        episode_steps = completed_steps[start : start + args.log_every]
+        step = int(episode_steps[-1]) + 1
+        mean_episode_return = episode_returns[episode_steps].mean()
+        mean_episode_length = episode_lengths[episode_steps].mean()
+        writer.add_scalar("rollout/ep_reward", float(mean_episode_return), step)
+        writer.add_scalar("rollout/ep_length", float(mean_episode_length), step)
+    for update in range(0, num_updates, args.log_every):
+        step = (update + 1) * args.num_steps * args.num_envs
+        writer.add_scalar("losses/actor_loss", float(actor_losses[update]), step)
+        writer.add_scalar("losses/entropy", float(entropies[update]), step)
+        writer.add_scalar("losses/critic_loss", float(critic_losses[update]), step)
+    writer.close()
+
+
+if __name__ == "__main__":
+    train(tyro.cli(Args))
