@@ -409,7 +409,7 @@ def train(args):
             ),
             (transitions, advantages, returns),
         )
-        # We Do the same for the initial lstm
+        # We do the same for the initial lstm
         initial_lstm_carry = jax.tree.map(
             lambda x: x.reshape(num_batches, args.batch_size, x.shape[-1]),
             initial_lstm_carry,
@@ -499,6 +499,7 @@ def evaluate(args, actor, rollout_state, eval_key):
 
 
 def tb_logger(args, metrics, log_dir, num_updates):
+    """Log results to tensorboard"""
     metrics = jax.device_get(metrics)
     actor_losses, entropies, critic_losses, dones, episode_returns, episode_lengths = metrics
     dones = dones.reshape(-1)
