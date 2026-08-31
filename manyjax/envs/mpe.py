@@ -75,7 +75,7 @@ class MPEInterface(JaxMARLEnv):
         dones = self._dict_to_jnp_array(dones)
         return obs, mdp_state, env_state, rewards, dones, False, infos
 
-    def sample(self, key):
+    def sample(self, key, state):
         ## TODO  should these functions be vmaped, or is it enough to do so in the training script
         sample_keys = jax.random.split(key, self.num_agents)
         action = jnp.array(
@@ -110,7 +110,7 @@ class MPEInterface(JaxMARLEnv):
 
     @property
     def reward_size(self):
-        return (self.num_agents,)
+        return ()
 
     @property
     def state_size(self):

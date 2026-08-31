@@ -83,6 +83,12 @@ def make_marl_env(args):
         from .smax import SMAXInterface
 
         env = SMAXInterface.make(args.env_name)
+    elif args.env_type == "jumanji":
+        from .jumanji import JumanjInterface
+
+        env = JumanjInterface.make(args.env_name)
+    else:
+        raise ValueError(f" Env not yet supported: {args.env_type}")
     env = VecMARLWrapper(env)
     env = RewardAggregatorWrapper(env=env, reward_aggr=args.reward_aggr)
     env = RecordVecMARLEpisodeStatistics(env)

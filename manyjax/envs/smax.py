@@ -48,8 +48,6 @@ class SMAXInterface(JaxMARLEnv):
         return obs, mdp_state, env_state
 
     def step(self, key, state, action):
-        # TODO write a wrapper that aggregates the rewards
-        # TODO recorder wrapper should report battle won
         #! rewards are still an array, not aggregated
         #! dones don't return __all__, only individual dones. It will be added to info
         action = {agent: action[i] for i, agent in enumerate(self.env.agents)}
@@ -60,16 +58,12 @@ class SMAXInterface(JaxMARLEnv):
         dones = self._dict_to_jnp_array(dones)
         return obs, mdp_state, env_state, rewards, dones, False, infos
 
-    def sample(self, key):
+    def sample(self, key, state):
         ## TODO  should these functions be vmaped, or is it enough to do so in the training script
-        sample_keys = jax.random.split(key, self.num_agents)
-        action = jnp.array(
-            [
-                self.env.action_spaces[self.env.agents[i]].sample(sample_keys[i])
-                for i in range(self.num_agents)
-            ]
-        )
-        return action
+        #! sample should also take the state to avoid sampling invalid actions
+        avail_actions = self.get_avail_actions(state)
+        logits = jnp.where(avail_actions, 0.0, -jnp.inf)
+        return jax.random.categorical(key, logits, axis=-1)
 
     def get_avail_actions(self, state):
         # TODO valid only for discrete actions

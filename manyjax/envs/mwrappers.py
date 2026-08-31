@@ -95,6 +95,7 @@ class RewardAggregatorWrapper(Wrapper):
             raise ValueError(f"{self.reward_aggr} is not supported")
 
     def step(self, key, state, action):
+        #! better to remove the if cond for jitted
         obs, mdp_state, env_state, rewards, dones, truncated, infos = self.env.step(key, state, action)
         if self.reward_aggr == "mean":
             rewards = jnp.mean(rewards, axis=-1, keepdims=True)
