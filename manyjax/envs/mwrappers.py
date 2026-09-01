@@ -34,8 +34,8 @@ class VecMARLWrapper(Wrapper):
     def get_avail_actions(self, state):
         return jax.vmap(fun=self.env.get_avail_actions, in_axes=0)(state)
 
-    def sample(self, key):
-        return jax.vmap(self.env.sample, in_axes=0)(key)
+    def sample(self, key, state):
+        return jax.vmap(self.env.sample, in_axes=0)(key, state)
 
 
 #! JAXmarl don't need a TimeLimit or Auto-reset wrapper
@@ -83,6 +83,9 @@ class RecordVecMARLEpisodeStatistics(Wrapper):
         )
         return obs, mdp_state, state, rewards, dones, truncated, infos
 
+    def sample(self, key, state):
+        return self.env.sample(key, state.env_state)
+
     def get_avail_actions(self, state):
         return self.env.get_avail_actions(state.env_state)
 
@@ -100,9 +103,13 @@ class RewardAggregatorWrapper(Wrapper):
         if self.reward_aggr == "mean":
             rewards = jnp.mean(rewards, axis=-1, keepdims=True)
             dones = jnp.expand_dims(infos["__all__"], axis=1)
+            truncated = jnp.expand_dims(truncated, axis=1)
         elif self.reward_aggr == "sum":
             rewards = jnp.sum(rewards, axis=-1, keepdims=True)
             dones = jnp.expand_dims(infos["__all__"], axis=1)
+            truncated = jnp.expand_dims(truncated, axis=1)
+        elif self.reward_aggr == "none":
+            truncated = jnp.repeat(jnp.expand_dims(truncated, axis=1), self.env.num_agents, -1)
         return obs, mdp_state, env_state, rewards, dones, truncated, infos
 
     @property
