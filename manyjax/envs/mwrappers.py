@@ -98,7 +98,6 @@ class RewardAggregatorWrapper(Wrapper):
             raise ValueError(f"{self.reward_aggr} is not supported")
 
     def step(self, key, state, action):
-        #! better to remove the if cond for jitted
         obs, mdp_state, env_state, rewards, dones, truncated, infos = self.env.step(key, state, action)
         if self.reward_aggr == "mean":
             rewards = jnp.mean(rewards, axis=-1, keepdims=True)
@@ -118,3 +117,25 @@ class RewardAggregatorWrapper(Wrapper):
             return (1,)
         else:
             return (self.env.num_agents,)
+
+
+class AgentID(Wrapper):
+    def reset(self, key):
+        obs, mdp_state, env_state = self.env.reset(key)
+        obs = self._add_agent_ids(obs)
+        return obs, mdp_state, env_state
+
+    def step(self, key, state, action):
+        obs, mdp_state, env_state, rewards, dones, truncated, infos = self.env.step(key, state, action)
+        obs = self._add_agent_ids(obs)
+        return obs, mdp_state, env_state, rewards, dones, truncated, infos
+
+    def _add_agent_ids(self, obs):
+        agent_ids = jnp.eye(self.num_agents)
+        agent_ids = jnp.broadcast_to(agent_ids, (obs.shape[0], *agent_ids.shape))
+        obs = jnp.concat([obs, agent_ids], axis=-1)
+        return obs
+
+    @property
+    def observation_size(self):
+        return self.env.observation_size + self.env.num_agents

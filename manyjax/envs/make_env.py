@@ -1,6 +1,6 @@
 """A func to prepare the environment"""
 
-from .mwrappers import RecordVecMARLEpisodeStatistics, RewardAggregatorWrapper, VecMARLWrapper
+from .mwrappers import AgentID, RecordVecMARLEpisodeStatistics, RewardAggregatorWrapper, VecMARLWrapper
 from .wrappers import (
     AutoResetWrapper,
     ClipAction,
@@ -90,6 +90,7 @@ def make_marl_env(args):
     else:
         raise ValueError(f" Env not yet supported: {args.env_type}")
     env = VecMARLWrapper(env)
+    env = AgentID(env)
     env = RewardAggregatorWrapper(env=env, reward_aggr=args.reward_aggr)
     env = RecordVecMARLEpisodeStatistics(env)
     return env
