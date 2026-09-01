@@ -84,7 +84,7 @@ class Args:
     """ Number of evaluation episodes"""
 
 
-# -------- Actor and critic nets --------
+# -------- Q(s,a) network --------
 class Qnetwork(nnx.Module):
     def __init__(
         self,
