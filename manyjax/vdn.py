@@ -249,8 +249,7 @@ def train(args):  # noqa: PLR0915
             qvals_vdn_next = jnp.sum(qvals_agents_next, axis=-1)
             targets = batch.first.reward + args.gamma * (1 - batch.first.done) * qvals_vdn_next
 
-            # dqn_loss: dqn loss
-            def dqn_loss(qnetwork):
+            def vdn_loss(qnetwork):
                 qvals = jnp.take_along_axis(
                     arr=qnetwork(obs=batch.first.obs, avail_actions=batch.first.avail_actions),
                     indices=jnp.expand_dims(batch.first.action, axis=-1),
@@ -260,7 +259,7 @@ def train(args):  # noqa: PLR0915
                 return optax.l2_loss(targets, qvals_vdn).mean()
 
             # Update the q_network
-            loss, grads = nnx.value_and_grad(dqn_loss)(qnetwork)
+            loss, grads = nnx.value_and_grad(vdn_loss)(qnetwork)
             optimizer.update(qnetwork, grads)
             return loss
 

@@ -91,23 +91,21 @@ def cleaner_reward_dones(timestep):
     num_agents = timestep.observation.agents_locations.shape[0]
     rewards = jnp.repeat(timestep.reward, num_agents)
     terminated = jnp.repeat(~timestep.discount.astype(bool), num_agents)
-    truncated = jnp.repeat(timestep.last().astype(bool), num_agents)
+    truncated = timestep.last().astype(bool)
     return rewards, terminated, truncated
 
 
 def connector_reward_dones(timestep):
-    num_agents = timestep.reward.shape[0]
     rewards = timestep.reward
     terminated = ~timestep.discount.astype(bool)
-    truncated = jnp.repeat(timestep.last().astype(bool), num_agents)
+    truncated = timestep.last().astype(bool)
     return rewards, terminated, truncated
 
 
 def lbf_reward_dones(timestep):
-    num_agents = timestep.reward.shape[0]
     rewards = timestep.reward
     terminated = ~timestep.discount.astype(bool)
-    truncated = jnp.repeat(timestep.last().astype(bool), num_agents)
+    truncated = timestep.last().astype(bool)
     return rewards, terminated, truncated
 
 
@@ -115,7 +113,7 @@ def rware_reward_dones(timestep):
     num_agents = timestep.observation.action_mask.shape[0]
     rewards = jnp.repeat(timestep.reward, num_agents)
     terminated = jnp.repeat(~timestep.discount.astype(bool), num_agents)
-    truncated = jnp.repeat(timestep.last().astype(bool), num_agents)
+    truncated = timestep.last().astype(bool)
     return rewards, terminated, truncated
 
 
@@ -179,7 +177,7 @@ class JumanjInterface(JaxMARLEnv):
         env_state_, timestep = self.env.reset(key)
         obs, mdp_state = self._get_obs_mdp_state(timestep)
         env_state = JumanjiState(env_state=env_state_, action_mask=timestep.observation.action_mask)
-        return obs, mdp_state, env_state
+        return obs, mdp_state.astype(jnp.float32), env_state
 
     def step(self, key, state, action):
         env_state_, timestep = self.env.step(state.env_state, action)
@@ -188,7 +186,7 @@ class JumanjInterface(JaxMARLEnv):
         infos = timestep.extras
         infos = {**infos, "__all__": jnp.all(truncated | terminated)}
         env_state = JumanjiState(env_state=env_state_, action_mask=timestep.observation.action_mask)
-        return obs, mdp_state, env_state, rewards, terminated, truncated, infos
+        return obs, mdp_state.astype(jnp.float32), env_state, rewards, terminated, truncated, infos
 
     def sample(self, key, state):
         avail_actions = self.get_avail_actions(state)
