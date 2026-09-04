@@ -1,3 +1,5 @@
+"""PPO for discrete actions with CNN-based policy"""
+
 import datetime
 import json
 import os
@@ -23,7 +25,7 @@ class Args:
     # Environment
     env_type: str = "gymnax"
     """ gymnax only """
-    env_name: str = "Freeway-MinAtar"
+    env_name: str = "Breakout-MinAtar"
     """ -MinAtar envs only """
     normalize_obs: bool = False
     """ Normalize the observations if True"""
@@ -32,9 +34,9 @@ class Args:
     # Training
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
-    num_envs: int = 8
+    num_envs: int = 32
     """num envs"""
-    num_steps: int = 2048
+    num_steps: int = 128
     """ Number of collected steps"""
     batch_size: int = 64
     """Batch size """
@@ -79,21 +81,13 @@ class Args:
 
 # -------- Actor and critic nets --------
 class Actor(nnx.Module):
-    def __init__(
-        self,
-        in_features: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        self.conv = nnx.Conv(
-            in_features, 16, kernel_size=(3, 3), kernel_init=kernel_init, padding="VALID", rngs=rngs
-        )
-        self.linear_layer = nnx.Linear(1024, 128, kernel_init=kernel_init, rngs=rngs)
-        self.logits = nnx.Linear(128, output_dim, kernel_init=kernel_init, rngs=rngs)
+    def __init__(self, in_features: int, output_dim: int, *, rngs: nnx.Rngs):
 
-    def __call__(self, obs: jnp.ndarray) -> distrax.Categorical:
+        self.conv = nnx.Conv(in_features, 16, kernel_size=(3, 3), padding="VALID", rngs=rngs)
+        self.linear_layer = nnx.Linear(1024, 128, rngs=rngs)
+        self.logits = nnx.Linear(128, output_dim, rngs=rngs)
+
+    def __call__(self, obs: jnp.ndarray):
         x = nnx.relu(self.conv(obs))
         x = x.reshape(x.shape[0], -1)
         x = nnx.relu(self.linear_layer(x))
@@ -101,7 +95,7 @@ class Actor(nnx.Module):
         pi = distrax.Categorical(logits)
         return pi
 
-    def get_action(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def get_action(self, obs: jnp.ndarray):
         x = obs.astype(jnp.float32)
         x = nnx.relu(self.conv(obs))
         x = x.reshape(x.shape[0], -1)
@@ -111,20 +105,13 @@ class Actor(nnx.Module):
 
 
 class Critic(nnx.Module):
-    def __init__(
-        self,
-        in_features: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        self.conv = nnx.Conv(
-            in_features, 16, kernel_size=(3, 3), kernel_init=kernel_init, padding="VALID", rngs=rngs
-        )
-        self.linear_layer = nnx.Linear(1024, 128, kernel_init=kernel_init, rngs=rngs)
-        self.critic = nnx.Linear(128, 1, kernel_init=kernel_init, rngs=rngs)
+    def __init__(self, in_features: int, *, rngs: nnx.Rngs):
 
-    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+        self.conv = nnx.Conv(in_features, 16, kernel_size=(3, 3), padding="VALID", rngs=rngs)
+        self.linear_layer = nnx.Linear(1024, 128, rngs=rngs)
+        self.critic = nnx.Linear(128, 1, rngs=rngs)
+
+    def __call__(self, obs: jnp.ndarray):
         x = obs.astype(jnp.float32)
         x = nnx.relu(self.conv(obs))
         x = x.reshape(x.shape[0], -1)
@@ -211,9 +198,7 @@ def train(args):
         actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key = update_state
 
         # ------ Collect env steps ------
-        def collect_rollout(
-            actor: nnx.Module, critic: nnx.Module, rollout_state: RolloutState
-        ) -> tuple[RolloutState, Transition, EpisodeStats]:
+        def collect_rollout(actor, critic, rollout_state):
             # env_one_step : one step for each environment
             def env_one_step(carry, x):
                 # Last rollout state
@@ -258,9 +243,7 @@ def train(args):
         # Compute the value of the last steps
         next_value = critic(obs=rollout_state.obs)
 
-        def compute_advantage_and_return(
-            transition: Transition, next_value: jax.Array
-        ) -> tuple[jax.Array, jax.Array]:
+        def compute_advantage_and_return(transition, next_value):
             # gae_t: one step GAE
             def gae_t(carry, transition):
                 gae, next_value = carry
@@ -392,7 +375,7 @@ def evaluate(args, actor, rollout_state, eval_key):
 
     evaluation_state = (obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key)
 
-    # Stops once all envs are done
+    # Stop once all envs are done
     def cond_fun(evaluation_state):
         return ~jnp.all(evaluation_state[-2])
 
