@@ -1,3 +1,5 @@
+"""PPO for discrete actions"""
+
 import datetime
 import json
 import os
@@ -41,13 +43,13 @@ class Args:
     # Training
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
-    num_envs: int = 8
+    num_envs: int = 32
     """num envs"""
-    num_steps: int = 2048
+    num_steps: int = 128
     """ Number of collected steps"""
     batch_size: int = 64
     """Batch size """
-    n_epochs: int = 3
+    n_epochs: int = 4
     """ Number of training epochs"""
     ppo_clip: float = 0.2
     """ PPO clipping factor """
@@ -73,7 +75,7 @@ class Args:
     log: bool = True
     """ Log data at the end """
     eval: bool = True
-    """ evaluate at the end """
+    """ Evaluate at the end """
     save_model: bool = False
     """ If True, save the weights of the agents and hyperparameters"""
     work_dir: str = "runs"
@@ -88,51 +90,34 @@ class Args:
 
 # -------- Actor and critic nets --------
 class Actor(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, output_dim: int, *, rngs: nnx.Rngs):
+
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(
-            nnx.Linear(hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(0.01), rngs=rngs)
-        )
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, output_dim, rngs=rngs))
         self.logits = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray) -> distrax.Categorical:
+    def __call__(self, obs: jnp.ndarray):
         logits = self.logits(obs)
         pi = distrax.Categorical(logits)
         return pi
 
-    def get_action(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def get_action(self, obs: jnp.ndarray):
         logits = self.logits(obs)
         return jnp.argmax(logits, axis=-1)
 
 
 class Critic(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, *, rngs: nnx.Rngs):
+
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(nnx.Linear(hidden_dim, 1, kernel_init=nnx.initializers.orthogonal(1), rngs=rngs))
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, 1, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs: jnp.ndarray):
         return self.critic(obs).squeeze(-1)
 
 
@@ -218,9 +203,7 @@ def train(args):
         actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key = update_state
 
         # ------ Collect env steps ------
-        def collect_rollout(
-            actor: nnx.Module, critic: nnx.Module, rollout_state: RolloutState
-        ) -> tuple[RolloutState, Transition, EpisodeStats]:
+        def collect_rollout(actor, critic, rollout_state):
             # env_one_step : one step for each environment
             def env_one_step(carry, x):
                 # Last rollout state
@@ -393,7 +376,7 @@ def evaluate(args, actor, rollout_state, eval_key):
     ep_dones = jnp.zeros(args.num_eval_ep, dtype=jnp.bool_)
     evaluation_state = (obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key)
 
-    # Stops once all envs are done
+    # Stop once all envs are done
     def cond_fun(evaluation_state):
         return ~jnp.all(evaluation_state[-2])
 
