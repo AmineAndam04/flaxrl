@@ -1,2 +1,4 @@
-# manyjax
-MARL with JAX
+# FlaxRL
+Single agent and multi-agent RL with JAX & Flax
+
+
