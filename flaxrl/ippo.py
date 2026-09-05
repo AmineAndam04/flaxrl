@@ -1,3 +1,6 @@
+"""IPPO: independent PPO
+See: https://cleanmarl-docs.readthedocs.io/en/latest/algorithms/ippo.html"""
+
 import datetime
 import json
 import os
@@ -40,11 +43,11 @@ class Args:
     # Training
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
-    num_envs: int = 8
+    num_envs: int = 64
     """num envs"""
     num_steps: int = 2048
     """ Number of collected steps"""
-    batch_size: int = 64
+    batch_size: int = 32
     """Batch size """
     n_epochs: int = 3
     """ Number of training epochs"""
@@ -87,53 +90,37 @@ class Args:
 
 # -------- Actor and critic nets --------
 class Actor(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, output_dim: int, *, rngs: nnx.Rngs):
+
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(
-            nnx.Linear(hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(0.01), rngs=rngs)
-        )
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, output_dim, rngs=rngs))
+
         self.logits = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray, avail_actions: jnp.ndarray) -> distrax.Categorical:
+    def __call__(self, obs, avail_actions):
         logits = self.logits(obs)
         logits = jnp.where(avail_actions, logits, -1e10)
         pi = distrax.Categorical(logits)
         return pi
 
-    def get_action(self, obs: jnp.ndarray, avail_actions: jnp.ndarray) -> jnp.ndarray:
+    def get_action(self, obs, avail_actions):
         logits = self.logits(obs)
         logits = jnp.where(avail_actions, logits, -1e10)
         return jnp.argmax(logits, axis=-1)
 
 
 class Critic(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, *, rngs: nnx.Rngs):
+
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(nnx.Linear(hidden_dim, 1, kernel_init=nnx.initializers.orthogonal(1), rngs=rngs))
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, 1, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs):
         return self.critic(obs).squeeze(-1)
 
 
@@ -178,7 +165,7 @@ def train(args):
     env = make_marl_env(args)
     # Vec training params
     num_steps = args.num_envs * args.num_steps
-    assert num_steps % args.batch_size == 0, "(args.num_envs * args.num_steps) % args.batch_size != 0"
+    assert (num_steps * env.num_agents) % args.batch_size == 0
     num_batches = num_steps * env.num_agents // args.batch_size
     num_updates = args.total_timesteps // num_steps
     # Prepare networks + optimizers
@@ -241,7 +228,7 @@ def train(args):
                 action = pi.sample(seed=key_act)
                 log_prob = pi.log_prob(action)
                 # Step the env
-                next_obs, _, next_env_state, reward, terminated, truncated, info = env.step(
+                next_obs, _, next_env_state, reward, terminated, _, info = env.step(
                     key_step, env_state, action
                 )
                 next_avail_actions = env.get_avail_actions(next_env_state)
@@ -277,13 +264,12 @@ def train(args):
             return rollout_state, transitions, episode_stats
 
         rollout_state, transitions, episode_stats = collect_rollout(actor, critic, rollout_state)
+
         # ------ Compute GAE advantages and returns ------
         # Compute the value of the last steps
         next_value = critic(obs=rollout_state.obs)
 
-        def compute_advantage_and_return(
-            transition: Transition, next_value: jax.Array
-        ) -> tuple[jax.Array, jax.Array]:
+        def compute_advantage_and_return(transition, next_value):
             # gae_t: one step GAE
             def gae_t(carry, transition):
                 gae, next_value = carry
@@ -316,6 +302,7 @@ def train(args):
                 batch_transition, batch_advantages, batch_returns = batch
                 actor, actor_optimizer, critic, critic_optimizer = carry
 
+                # ------ Update the actor
                 def ppo_actor_loss(actor, b_obs, b_action, b_avail_actions, b_log_probs, b_adv):
                     pi = actor(obs=b_obs, avail_actions=b_avail_actions)
                     b_new_log_prob = pi.log_prob(b_action)
@@ -326,11 +313,6 @@ def train(args):
                     entropy = pi.entropy().mean()
                     ac_loss = pg_loss - args.entropy_coef * entropy
                     return ac_loss, entropy
-
-                def ppo_critic_loss(critic, b_obs, b_returns):
-                    values = critic(obs=b_obs)
-                    cr_loss = optax.l2_loss(values, b_returns).mean()
-                    return cr_loss
 
                 # Compute actor loss and gradients
                 (ac_loss, entropy), ac_grads = nnx.value_and_grad(ppo_actor_loss, has_aux=True)(
@@ -343,6 +325,13 @@ def train(args):
                 )
                 # Update the actor
                 actor_optimizer.update(actor, ac_grads)
+
+                # ------ Update the critic
+                def ppo_critic_loss(critic, b_obs, b_returns):
+                    values = critic(obs=b_obs)
+                    cr_loss = optax.l2_loss(values, b_returns).mean()
+                    return cr_loss
+
                 # Compute critic loss and gradients
                 cr_loss, cr_grads = nnx.value_and_grad(ppo_critic_loss)(
                     critic, batch_transition.obs, batch_returns
@@ -390,7 +379,7 @@ def train(args):
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
-    actor, _, critic, _, _, _ = update_state
+    actor, *_ = update_state
 
     # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
@@ -452,7 +441,7 @@ def evaluate(args, actor, eval_key):
         action = actor.get_action(obs, avail_actions=avail_actions)
         next_obs, _, next_state, reward, _, _, infos = eval_env.step(key_step, env_state, action)
         avail_actions = eval_env.get_avail_actions(next_state)
-        reward = jnp.mean(reward, axis=-1)
+        reward = jnp.sum(reward, axis=-1) if args.reward_aggr == "sum" else jnp.mean(reward, axis=-1)
         active = ~ep_dones.astype(bool)
         eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
         eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)

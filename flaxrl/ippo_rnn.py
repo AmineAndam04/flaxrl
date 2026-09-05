@@ -1,3 +1,5 @@
+"""Recurrent IPPO"""
+
 import datetime
 import json
 import os
@@ -18,7 +20,6 @@ from flax import nnx
 from tensorboardX import SummaryWriter
 
 
-# TODO support reward normalization
 @dataclass
 class Args:
     # Environment
@@ -38,11 +39,11 @@ class Args:
     # Training
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
-    num_envs: int = 8
+    num_envs: int = 32
     """num envs"""
     num_steps: int = 2048
     """ Number of collected steps"""
-    batch_size: int = 64
+    batch_size: int = 8
     """Batch size """
     n_epochs: int = 3
     """ Number of training epochs"""
@@ -85,21 +86,13 @@ class Args:
 
 # -------- Actor and critic nets --------
 class Actor(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.embed = nnx.Sequential(nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.tanh)
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, *, rngs: nnx.Rngs):
+
+        self.embed = nnx.Sequential(nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu)
         self.lstm = nnx.LSTMCell(in_features=hidden_dim, hidden_features=hidden_dim, rngs=rngs)
         self.logits = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
 
-    def __call__(
-        self, carry: jnp.ndarray, obs: jnp.ndarray, avail_actions: jnp.ndarray
-    ) -> distrax.Categorical:
+    def __call__(self, carry, obs, avail_actions):
         x = self.embed(obs)
         carry, x = self.lstm(carry, x)
         logits = self.logits(x)
@@ -129,7 +122,7 @@ class Actor(nnx.Module):
         pi = distrax.Categorical(logits)
         return pi
 
-    def get_action(self, carry: jnp.ndarray, obs: jnp.ndarray, avail_actions: jnp.ndarray):
+    def get_action(self, carry, obs, avail_actions):
         x = self.embed(obs)
         carry, x = self.lstm(carry, x)
         logits = self.logits(x)
@@ -141,22 +134,15 @@ class Actor(nnx.Module):
 
 
 class Critic(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, *, rngs: nnx.Rngs):
+
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(nnx.Linear(hidden_dim, 1, kernel_init=nnx.initializers.orthogonal(1), rngs=rngs))
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, 1, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs):
         return self.critic(obs).squeeze(-1)
 
 
@@ -199,7 +185,7 @@ def train(args):
     # Rng keys
     key = jax.random.key(args.seed)
     rngs = nnx.Rngs(args.seed)
-    key, reset_key, shuffle_key, eval_key = jax.random.split(key, 4)
+    key, reset_key, eval_key = jax.random.split(key, 3)
     # Import the environment
     env = make_marl_env(args)
     # Vec training params
@@ -258,7 +244,7 @@ def train(args):
     )
     def update_step(update_state: tuple, _):  # noqa: PLR0915
 
-        actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key = update_state
+        actor, actor_optimizer, critic, critic_optimizer, rollout_state = update_state
         initial_lstm_carry = rollout_state.lstm_carry
 
         # ------ Collect env steps ------
@@ -335,9 +321,7 @@ def train(args):
         # Compute the value of the last steps
         next_value = critic(obs=rollout_state.obs)
 
-        def compute_advantage_and_return(
-            transition: Transition, next_value: jax.Array
-        ) -> tuple[jax.Array, jax.Array]:
+        def compute_advantage_and_return(transition, next_value):
             # gae_t: one step GAE
             def gae_t(carry, transition):
                 gae, next_value = carry
@@ -441,7 +425,7 @@ def train(args):
         (actor, actor_optimizer, critic, critic_optimizer), losses = ppo_epoch(
             (actor, actor_optimizer, critic, critic_optimizer), batches
         )
-        update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key
+        update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state
         losses = jax.tree.map(lambda x: x.mean(), losses)
         metrics = (
             *losses,
@@ -453,14 +437,14 @@ def train(args):
         return update_state, metrics
 
     # ------ Run IPPO ------
-    update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key
+    update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state
     start_time = time.perf_counter()
     update_state, metrics = update_step(update_state, None)
     jax.block_until_ready(metrics)
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
-    actor, _, critic, _, _, _ = update_state
+    actor, *_ = update_state
 
     # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
@@ -531,7 +515,7 @@ def evaluate(args, actor, eval_key):
         action = action.reshape(args.num_eval_ep, eval_env.num_agents)
         next_obs, _, next_state, reward, _, _, infos = eval_env.step(key_step, env_state, action)
         avail_actions = eval_env.get_avail_actions(next_state)
-        reward = jnp.mean(reward, axis=-1)
+        reward = jnp.sum(reward, axis=-1) if args.reward_aggr == "sum" else jnp.mean(reward, axis=-1)
         active = ~ep_dones.astype(bool)
         eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
         eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
