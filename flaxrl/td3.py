@@ -60,9 +60,9 @@ class Args:
     batch_size: int = 64
     """ Batch size """
     train_freq_critic: int = 10
-    """ Train the critics every train_freq environment steps"""
+    """ Train the critics every train_freq_critic environment steps"""
     train_freq_actor: int = 20
-    """ Train the actor every train_freq environment steps"""
+    """ Train the actor every train_freq_actor environment steps"""
     learning_starts: int = 70
     """ Number of env steps to initialize the replay buffer"""
     optimizer: str = "adam"

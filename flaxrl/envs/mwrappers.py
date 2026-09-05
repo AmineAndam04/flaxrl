@@ -38,10 +38,6 @@ class VecMARLWrapper(Wrapper):
         return jax.vmap(self.env.sample, in_axes=0)(key, state)
 
 
-#! JAXmarl don't need a TimeLimit or Auto-reset wrapper
-## ------ Record Episodic statistics, valid only for vmap-ed envs
-
-
 @struct.dataclass
 class RecordVecEpisodeStatisticsState:
     env_state: Any
@@ -49,6 +45,7 @@ class RecordVecEpisodeStatisticsState:
     episode_length: jax.Array
 
 
+#! valid only for vmap-ed envs
 class RecordVecMARLEpisodeStatistics(Wrapper):
     def reset(self, key):
         obs, mdp_state, env_state = self.env.reset(key)
@@ -90,6 +87,7 @@ class RecordVecMARLEpisodeStatistics(Wrapper):
         return self.env.get_avail_actions(state.env_state)
 
 
+#! valid only for vmap-ed envs
 class RewardAggregatorWrapper(Wrapper):
     def __init__(self, env, reward_aggr="mean"):
         super().__init__(env)

@@ -101,7 +101,7 @@ class Actor(nnx.Module):
     def __init__(
         self, input_dim: int, hidden_dim: int, output_dim: int, log_std_init: float, *, rngs: nnx.Rngs
     ):
-        self.embed = nnx.Sequential(nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.tanh)
+        self.embed = nnx.Sequential(nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu)
         self.lstm = nnx.LSTMCell(in_features=hidden_dim, hidden_features=hidden_dim, rngs=rngs)
         self.mean = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
         self.log_std = nnx.Param(jnp.zeros(output_dim) + log_std_init)
@@ -148,9 +148,9 @@ class Actor(nnx.Module):
 
 class Critic(nnx.Module):
     def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, *, rngs: nnx.Rngs):
-        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.tanh]
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.tanh])
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
         layers.append(nnx.Linear(hidden_dim, 1, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 

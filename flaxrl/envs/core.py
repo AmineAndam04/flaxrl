@@ -40,7 +40,7 @@ class JaxRLEnv(ABC):
 
 class JaxMARLEnv(ABC):
     @abstractmethod
-    def reset(self, key) -> tuple[Any, Any, Any, Any]:
+    def reset(self, key):
         """Should return: obs, state"""
         pass
 
