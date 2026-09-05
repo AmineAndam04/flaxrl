@@ -108,41 +108,30 @@ class Actor(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(
-            nnx.Linear(hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(0.01), rngs=rngs)
-        )
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, output_dim, rngs=rngs))
         self.mean = nnx.Sequential(*layers)
         self.log_std = nnx.Param(jnp.zeros(output_dim) + log_std_init)
 
-    def __call__(self, obs: jnp.ndarray) -> distrax.MultivariateNormalDiag:
+    def __call__(self, obs: jnp.ndarray):
         mean = self.mean(obs)
         log_std = jnp.broadcast_to(self.log_std, mean.shape)
         pi = distrax.MultivariateNormalDiag(mean, jnp.exp(log_std))
         return pi
 
-    def get_action(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def get_action(self, obs: jnp.ndarray):
         mean = self.mean(obs)
         return mean
 
 
 class Critic(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, *, rngs: nnx.Rngs):
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(nnx.Linear(hidden_dim, 1, kernel_init=nnx.initializers.orthogonal(1), rngs=rngs))
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, 1, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
@@ -307,7 +296,7 @@ def train(args):
                 batch_transition, batch_advantages, batch_returns = batch
                 actor, actor_optimizer, critic, critic_optimizer = carry
 
-                # ppo_actor_loss: actor loss
+                # Update the actor
                 def ppo_actor_loss(actor, b_obs, b_action, b_log_probs, b_adv):
                     pi = actor(obs=b_obs)
                     b_new_log_prob = pi.log_prob(b_action)
@@ -319,13 +308,6 @@ def train(args):
                     ac_loss = pg_loss - args.entropy_coef * entropy
                     return ac_loss, entropy
 
-                # ppo_critic_loss: critic loss
-                def ppo_critic_loss(critic, b_obs, b_returns):
-                    values = critic(obs=b_obs)
-                    cr_loss = optax.l2_loss(values, b_returns).mean()
-                    return cr_loss
-
-                # Compute actor loss and gradients
                 (ac_loss, entropy), ac_grads = nnx.value_and_grad(ppo_actor_loss, has_aux=True)(
                     actor,
                     batch_transition.obs,
@@ -333,13 +315,17 @@ def train(args):
                     batch_transition.log_prob,
                     batch_advantages,
                 )
-                # Update the actor
                 actor_optimizer.update(actor, ac_grads)
-                # Compute critic loss and gradients
+
+                # Update the critic
+                def ppo_critic_loss(critic, b_obs, b_returns):
+                    values = critic(obs=b_obs)
+                    cr_loss = optax.l2_loss(values, b_returns).mean()
+                    return cr_loss
+
                 cr_loss, cr_grads = nnx.value_and_grad(ppo_critic_loss)(
                     critic, batch_transition.obs, batch_returns
                 )
-                # Update the critic
                 critic_optimizer.update(critic, cr_grads)
                 carry = (actor, actor_optimizer, critic, critic_optimizer)
                 return carry, (ac_loss, entropy, cr_loss)

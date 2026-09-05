@@ -1,23 +1,22 @@
 """Inspired from https://github.com/RobertTLange/gymnax-blines/blob/main/visualize.py"""
 
-import os
 import argparse
 import json
-import gymnax
-from gymnax.visualize import Visualizer
-import jax
-import jax.numpy as jnp
-import orbax.checkpoint as ocp
-from flax import nnx
-import numpy as np
-from types import SimpleNamespace
-
+import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from envs.make_env import make_env
+import gymnax
+import jax
+import numpy as np
+import orbax.checkpoint as ocp
+from flax import nnx
+from gymnax.visualize import Visualizer
+from envs.gymnax import GymnaxInterface
+from envs.wrappers import VecWrapper
 
 
 def load_mode(train_args, model_path, which_ppo, observation_size, action_size, seed):
@@ -81,7 +80,17 @@ if __name__ == "__main__":
         train_args = json.load(f)
     train_args = SimpleNamespace(**train_args)
 
-    env = make_env(train_args)  # TODO save normalization stats
+    env = GymnaxInterface.make(train_args.env_name)
+    env = VecWrapper(env)
+    if train_args.normalize_obs:
+        from envs.wrappers import NormalizeVecObservationEval
+
+        normalization_state = np.load(os.path.abspath(f"{args.model_path}/obs_normalization.npz"))
+        env = NormalizeVecObservationEval(
+            env, obs_mean=normalization_state["mean"], obs_var=normalization_state["var"]
+        )
+    jitted_reset = jax.jit(env.reset)
+    jitted_step = jax.jit(env.step)
     env_, env_params = gymnax.make(train_args.env_name)
     # policy
     policy = load_mode(
@@ -91,17 +100,17 @@ if __name__ == "__main__":
     key = jax.random.key(args.seed)
     key, reset_key = jax.random.split(key)
     reset_key = jax.random.split(reset_key, 1)
-    obs, env_state = env.reset(reset_key)
+    obs, env_state = jitted_reset(reset_key)
     step = 0
     state_seq, reward_seq = [], []
     while True:
         key, key_step = jax.random.split(key)
         key_step = jax.random.split(key_step, 1)
         action = policy.get_action(obs)
-        next_obs, next_env_state, reward, terminated, truncated, _ = env.step(key_step, env_state, action)
+        next_obs, next_env_state, reward, terminated, truncated, _ = jitted_step(key_step, env_state, action)
         done = terminated or truncated
         reward_seq.append(reward.squeeze(0))
-        state_seq.append(jax.tree.map(lambda x: x.squeeze(0), env_state.env_state))
+        state_seq.append(jax.tree.map(lambda x: x.squeeze(0), env_state))
         if done or step == args.max_frames:
             break
         else:
