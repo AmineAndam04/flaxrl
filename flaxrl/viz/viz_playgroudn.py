@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import jax
-import numpy as np
 import mediapy as media
+import numpy as np
 import orbax.checkpoint as ocp
 from envs.mujoco_playground import PlaygroundInterface
 from envs.wrappers import VecWrapper
@@ -28,8 +28,18 @@ def load_mode(train_args, model_path, which_ppo, observation_size, action_size, 
             log_std_init=train_args.log_std_init,
             rngs=nnx.Rngs(seed),
         )
-    elif which_ppo == "ppo_cnn":
-        pass
+    elif which_ppo == "ppo_rnn":
+        from ppo_rnn import Actor
+
+        abstract_actor = nnx.eval_shape(
+            lambda: Actor(
+                input_dim=observation_size,
+                hidden_dim=train_args.actor_hidden_dim,
+                output_dim=action_size,
+                log_std_init=train_args.log_std_init,
+                rngs=nnx.Rngs(seed),
+            )
+        )
 
     graphdef, abstract_state = nnx.split(abstract_actor)
     checkpoint_path = os.path.abspath(f"{model_path}/policy")
@@ -64,11 +74,24 @@ if __name__ == "__main__":
         env = NormalizeVecObservationEval(
             env, obs_mean=normalization_state["mean"], obs_var=normalization_state["var"]
         )
+
     print("++ ENV LOADED")
     # Policy
     policy = load_mode(
         train_args, args.model_path, args.which_ppo, env.observation_size, env.action_size, args.seed
     )
+    if "rnn" in args.which_ppo:
+        lstm_carry = policy.initialize_carry(1, train_args.actor_hidden_dim)
+
+        def get_action(carry, x):
+            return policy.get_action(carry, x)
+
+    else:
+        lstm_carry = None
+
+        def get_action(carry, x):
+            return (carry, policy.get_action(x))
+
     print("++ POLICY LOADED")
     # collect steps
     key = jax.random.key(args.seed)
@@ -82,7 +105,7 @@ if __name__ == "__main__":
     while True:
         key, key_step = jax.random.split(key)
         key_step = jax.random.split(key_step, 1)
-        action = policy.get_action(obs)
+        lstm_carry, action = policy.get_action(lstm_carry, obs)
         next_obs, next_env_state, reward, terminated, truncated, _ = jitted_step(key_step, env_state, action)
         done = terminated or truncated
         state_seq.append(jax.tree.map(lambda x: x.squeeze(0), env_state))

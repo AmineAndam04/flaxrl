@@ -13,15 +13,15 @@ import gymnax
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
-from flax import nnx
-from gymnax.visualize import Visualizer
 from envs.gymnax import GymnaxInterface
 from envs.wrappers import VecWrapper
+from flax import nnx
+from gymnax.visualize import Visualizer
 
 
-def load_mode(train_args, model_path, which_ppo, observation_size, action_size, seed):
+def load_mode(train_args, model_path, which_algo, observation_size, action_size):
 
-    if which_ppo == "ppo":
+    if which_algo == "ppo":
         from ppo import Actor
 
         abstract_actor = nnx.eval_shape(
@@ -30,20 +30,20 @@ def load_mode(train_args, model_path, which_ppo, observation_size, action_size, 
                 hidden_dim=train_args.actor_hidden_dim,
                 num_layers=train_args.actor_num_layers,
                 output_dim=action_size,
-                rngs=nnx.Rngs(seed),
+                rngs=nnx.Rngs(0),
             )
         )
-    elif which_ppo == "ppo_cnn":
+    elif which_algo == "ppo_cnn":
         from ppo_cnn import Actor
 
         abstract_actor = nnx.eval_shape(
             lambda: Actor(
                 in_features=observation_size[-1],
                 output_dim=action_size,
-                rngs=nnx.Rngs(seed),
+                rngs=nnx.Rngs(0),
             )
         )
-    elif which_ppo == "ppo_continuous":
+    elif which_algo == "ppo_continuous":
         from ppo_continuous import Actor
 
         abstract_actor = nnx.eval_shape(
@@ -53,8 +53,38 @@ def load_mode(train_args, model_path, which_ppo, observation_size, action_size, 
                 num_layers=train_args.actor_num_layers,
                 output_dim=action_size,
                 log_std_init=train_args.log_std_init,
-                rngs=nnx.Rngs(seed),
+                rngs=nnx.Rngs(0),
             )
+        )
+    elif which_algo == "ppo_rnn":
+        from ppo_rnn import Actor
+
+        abstract_actor = nnx.eval_shape(
+            lambda: Actor(
+                input_dim=observation_size,
+                hidden_dim=train_args.actor_hidden_dim,
+                output_dim=action_size,
+                log_std_init=train_args.log_std_init,
+                rngs=nnx.Rngs(0),
+            )
+        )
+    elif which_algo == "dqn":
+        from dqn import Qnetwork
+
+        abstract_actor = nnx.eval_shape(
+            lambda: Qnetwork(
+                input_dim=observation_size,
+                hidden_dim=train_args.hidden_dim,
+                num_layers=train_args.num_layers,
+                output_dim=action_size,
+                rngs=nnx.Rngs(0),
+            )
+        )
+    elif which_algo == "dqn_cnn":
+        from dqn_cnn import Qnetwork
+
+        abstract_actor = nnx.eval_shape(
+            lambda: Qnetwork(in_features=observation_size[-1], output_dim=action_size, rngs=nnx.Rngs(0))
         )
 
     graphdef, abstract_state = nnx.split(abstract_actor)
@@ -72,7 +102,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="rollouts", help="Output GIF path")
     parser.add_argument("--seed", type=int, default=120, help="Rollout seed")
     parser.add_argument("--max-frames", type=int, default=500)
-    parser.add_argument("--which-ppo", type=str, default="ppo")
+    parser.add_argument("--which-algo", type=str, default="ppo")
     args = parser.parse_args()
     # Load the model
     args_path = f"{args.model_path}/args.json"
@@ -93,9 +123,19 @@ if __name__ == "__main__":
     jitted_step = jax.jit(env.step)
     env_, env_params = gymnax.make(train_args.env_name)
     # policy
-    policy = load_mode(
-        train_args, args.model_path, args.which_ppo, env.observation_size, env.action_size, args.seed
-    )
+    policy = load_mode(train_args, args.model_path, args.which_algo, env.observation_size, env.action_size)
+    if "rnn" in args.which_algo:
+        lstm_carry = policy.initialize_carry(1, train_args.actor_hidden_dim)
+
+        def get_action(carry, x):
+            return policy.get_action(carry, x)
+
+    else:
+        lstm_carry = None
+
+        def get_action(carry, x):
+            return (carry, policy.get_action(x))
+
     # collect steps
     key = jax.random.key(args.seed)
     key, reset_key = jax.random.split(key)
@@ -106,7 +146,7 @@ if __name__ == "__main__":
     while True:
         key, key_step = jax.random.split(key)
         key_step = jax.random.split(key_step, 1)
-        action = policy.get_action(obs)
+        lstm_carry, action = get_action(lstm_carry, obs)
         next_obs, next_env_state, reward, terminated, truncated, _ = jitted_step(key_step, env_state, action)
         done = terminated or truncated
         reward_seq.append(reward.squeeze(0))
