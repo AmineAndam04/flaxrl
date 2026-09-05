@@ -1,5 +1,8 @@
+"""DQN with recurrent nets"""
+
 import datetime
 import json
+import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -25,15 +28,13 @@ class Args:
     """ gymnax """
     env_name: str = "CartPole-v1"
     """ Discrete envs only """
-    normalize_obs: bool = False
+    normalize_obs: bool = False  #! not supported for now
     """ Normalize the observations if True"""
     normalize_reward: bool = False
     """ Normalize the rewards if True"""
     # Network
     hidden_dim: int = 64
     """ Hidden dimension"""
-    num_layers: int = 1
-    """ Number of hidden layers"""
     # Training
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
@@ -47,20 +48,16 @@ class Args:
     """ Batch size """
     n_epochs: int = 3
     """ Number of training epochs"""
-    train_freq: int = 10
-    """ Train the network every train_freq environment steps"""
-    learning_starts: int = 70
+    learning_starts: int = 1000
     """ Number of env steps to initialize the replay buffer"""
     optimizer: str = "adam"
     """ The optimizer"""
     learning_rate: float = 0.0008
-    """ Learning rate for the actor"""
+    """ Learning rate"""
     gamma: float = 0.99
     """ Discount factor"""
     clip_gradients: float = -1
     """ Disable gradient clipping when <= 0; otherwise clip at this value"""
-    target_network_update_freq: int = 10
-    """ Update the target network every target_network_update_freq step in the environment"""
     polyak: float = 0.005
     """ Polyak coefficient for target network update"""
     start_e: float = 1
@@ -89,17 +86,9 @@ class Args:
 
 
 # -------- Q(s,a) network --------
-
-
 class Qnetwork(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, *, rngs: nnx.Rngs):
+
         self.embed = nnx.Sequential(nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu)
         self.lstm = nnx.LSTMCell(in_features=hidden_dim, hidden_features=hidden_dim, rngs=rngs)
         self.qnet = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
@@ -130,10 +119,8 @@ class Qnetwork(nnx.Module):
         values = self.qnet(x)
         return values
 
-    def get_action(self, carry, obs) -> jnp.ndarray:
-        x = self.embed(obs)
-        carry, x = self.lstm(carry, x)
-        values = self.qnet(x)
+    def get_action(self, carry, obs):
+        carry, values = self(carry, obs)
         return carry, jnp.argmax(values, axis=-1)
 
     def initialize_carry(self, num_envs, hidden_dim):
@@ -173,12 +160,10 @@ class EpisodeStats(NamedTuple):
 def train(args):
     # Vec training params
     num_updates = args.total_timesteps // (args.num_envs * args.num_steps)
-    assert args.train_freq % args.num_envs == 0, "args.train_freq % args.num_envs != 0"
     # Rng keys
     key = jax.random.key(args.seed)
     rngs = nnx.Rngs(args.seed)
     key, reset_key, eval_key = jax.random.split(key, 3)
-    # TODO Do I need to keep this one
     reset_key = jax.random.split(reset_key, args.num_envs)
     # Import the environment
     env = make_env(args)
@@ -249,8 +234,7 @@ def train(args):
                 key_step = jax.random.split(key_step, args.num_envs)
                 key_sample = jax.random.split(key_sample, args.num_envs)
                 # Get action
-                lstm_carry, q_vals = qnetwork(carry=lstm_carry, obs=obs)
-                action = jnp.argmax(q_vals, axis=-1)
+                lstm_carry, action = qnetwork.get_action(carry=lstm_carry, obs=obs)
                 eps = eps_scheduler(t=step)
                 p_explore = jax.random.uniform(key_eps, args.num_envs)
                 action = jnp.where(p_explore < eps, env.sample(key_sample), action)
@@ -283,8 +267,7 @@ def train(args):
             return rollout_state, transitions, episode_stats
 
         # We always restart the env to 'safely' initialize the LSTM hidden state to zero during training
-        # key, reset_key = jax.random.split(key)
-        # reset_key = jax.random.split(reset_key, args.num_envs)
+        # We want the first obs of a sampled batches to be obs_{t=0}
         # Reset env + lstm + rollout
         obs, env_state = env.reset(key=reset_key)
         lstm_carry = qnetwork.initialize_carry(args.num_envs, args.hidden_dim)
@@ -292,7 +275,7 @@ def train(args):
             obs=obs,
             env_state=env_state,
             lstm_carry=lstm_carry,
-            episode_start=jnp.zeros(args.num_envs).astype(bool),
+            episode_start=jnp.ones(args.num_envs).astype(bool),
             step=step,
             key=key,
         )
@@ -300,11 +283,12 @@ def train(args):
         key = rollout_state.key
         step = rollout_state.step
 
-        # The replay buffer is if shape (add_batch_size,max_length_time_axis)
+        # Reshape timesteps from (num_steps, num_envs,**) to (num_envs,num_steps ,**)
+        # The replay buffer is of shape (add_batch_size,max_length_time_axis)
         timesteps = jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), timesteps)
         buffer = rb_fun.add(buffer, timesteps)
 
-        # ------ Update the q network ------
+        # ------ Update the q network for n_epochs ------
         @nnx.scan(length=args.n_epochs, in_axes=(nnx.Carry, None), out_axes=(nnx.Carry, 0))
         def update_qnetwork(carry, x):
             qnetwork, optimizer, key = carry
@@ -337,10 +321,6 @@ def train(args):
 
         # Decide if it is time to update
         update_event = jnp.logical_and(rb_fun.can_sample(buffer), rollout_state.step >= args.learning_starts)
-
-        # It is important to use nnx.cond not jax.lax.cond. Otherwise the network will not be updated
-        # Rule of thumb: if the transformation modified the params of the network\optimize,
-        # always use nnx. transformations
         (qnetwork, optimizer, key), loss = nnx.cond(
             update_event,
             update_qnetwork,
@@ -372,26 +352,25 @@ def train(args):
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
-    qnetwork, _, _, rollout_state, *_ = update_state
+    qnetwork, *_ = update_state
     # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
-        evaluate(args, qnetwork, rollout_state, eval_key)
+        evaluate(args, qnetwork, eval_key)
     if args.log:
-        tb_logger(args, metrics, log_dir, num_updates)
+        tb_logger(args, metrics, log_dir)
     if args.save_model:
-        qnetwork, *_ = update_state
         _, qnetwork_state = nnx.split(qnetwork)
-        network_states = {"qnetwork": qnetwork_state}
-        checkpoint_path = (Path(log_dir) / "networks").resolve()
-        with ocp.StandardCheckpointer() as checkpointer:
-            checkpointer.save(checkpoint_path, network_states)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpoint_path = os.path.abspath(f"{log_dir}/policy")
+        checkpointer.save(checkpoint_path, qnetwork_state)
+        checkpointer.wait_until_finished()
         print(f"Networks saved to {checkpoint_path}")
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
 
 
-def evaluate(args, qnetwork, rollout_state, eval_key):
-    eval_env = make_env(args, eval=True, rollout_state=rollout_state)
+def evaluate(args, qnetwork, eval_key):
+    eval_env = make_env(args, eval=True, rollout_state=None)
     eval_key, reset_key = jax.random.split(eval_key)
     reset_key = jax.random.split(reset_key, args.num_eval_ep)
     obs, env_state = eval_env.reset(reset_key)
@@ -437,7 +416,7 @@ def evaluate(args, qnetwork, rollout_state, eval_key):
     print(f"Episode length: {mean_length:.1f} ± {std_length:.1f}")
 
 
-def tb_logger(args, metrics, log_dir, num_updates):
+def tb_logger(args, metrics, log_dir):
     metrics = jax.device_get(metrics)
     losses, update_events, episode_returns, episode_lengths, ep_dones = metrics
     losses = losses.reshape(-1)
@@ -468,7 +447,6 @@ def linear_schedule_(start_e: float, end_e: float, duration: int, t: int):
     return jnp.clip(slope * t + start_e, end_e)
 
 
-# polyak_update
 def polyak_update_(network, target_network, tau):
     params = nnx.state(network, nnx.Param)
     target_params = nnx.state(target_network, nnx.Param)

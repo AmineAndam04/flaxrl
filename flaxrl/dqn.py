@@ -1,5 +1,8 @@
+"""DQN with MLP nets"""
+
 import datetime
 import json
+import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -50,7 +53,7 @@ class Args:
     optimizer: str = "adam"
     """ The optimizer"""
     learning_rate: float = 0.0008
-    """ Learning rate for the actor"""
+    """ Learning rate"""
     gamma: float = 0.99
     """ Discount factor"""
     clip_gradients: float = -1
@@ -86,23 +89,20 @@ class Args:
 
 # -------- Q(s,a) network --------
 class Qnetwork(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, output_dim: int, *, rngs: nnx.Rngs):
+
         layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
             layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
         layers.append(nnx.Linear(hidden_dim, output_dim, rngs=rngs))
         self.qnet = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs):
         return self.qnet(obs)
+
+    def get_action(self, obs):
+        qvals = self.qnet(obs)
+        return jnp.argmax(qvals, axis=-1)
 
 
 # -------- States --------
@@ -203,8 +203,7 @@ def train(args):
         key_step = jax.random.split(key_step, args.num_envs)
         key_sample = jax.random.split(key_sample, args.num_envs)
         # Get action
-        q_vals = qnetwork(obs=obs)
-        action = jnp.argmax(q_vals, axis=-1)
+        action = qnetwork.get_action(obs=obs)
         eps = eps_scheduler(t=step)
         p_explore = jax.random.uniform(key_eps, args.num_envs)
         action = jnp.where(p_explore < eps, env.sample(key_sample), action)
@@ -254,7 +253,7 @@ def train(args):
         loss = nnx.cond(
             update_event,
             update_qnetwork,
-            lambda x, y, z: jnp.array(0.0),
+            lambda *_: jnp.array(0.0),
             qnetwork,
             optimizer,
             key_sample,
@@ -292,13 +291,23 @@ def train(args):
     if args.log:
         tb_logger(args, metrics, log_dir)
     if args.save_model:
-        qnetwork, *_ = update_state
         _, qnetwork_state = nnx.split(qnetwork)
-        network_states = {"qnetwork": qnetwork_state}
-        checkpoint_path = (Path(log_dir) / "networks").resolve()
-        with ocp.StandardCheckpointer() as checkpointer:
-            checkpointer.save(checkpoint_path, network_states)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpoint_path = os.path.abspath(f"{log_dir}/policy")
+        checkpointer.save(checkpoint_path, qnetwork_state)
+        checkpointer.wait_until_finished()
         print(f"Networks saved to {checkpoint_path}")
+        # Save normalization statistics
+        if args.normalize_obs:
+            from envs.make_env import get_state
+            from envs.wrappers import NormalizeVecObservationState
+
+            normalization_state = get_state(rollout_state, NormalizeVecObservationState)
+            np.savez(
+                Path(log_dir) / "obs_normalization.npz",
+                mean=np.asarray(normalization_state.mean),
+                var=np.asarray(normalization_state.var),
+            )
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
 
@@ -314,7 +323,7 @@ def evaluate(args, qnetwork, rollout_state, eval_key):
     ep_dones = jnp.zeros(args.num_eval_ep, dtype=jnp.bool_)
     evaluation_state = (obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key)
 
-    # Stops once all envs are done
+    # Stop once all envs are done
     def cond_fun(evaluation_state):
         return ~jnp.all(evaluation_state[-2])
 
@@ -323,8 +332,7 @@ def evaluate(args, qnetwork, rollout_state, eval_key):
         obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key = evaluation_state
         eval_key, key_step = jax.random.split(eval_key)
         key_step = jax.random.split(key_step, args.num_eval_ep)
-        q_vals = qnetwork(obs=obs)
-        action = jnp.argmax(q_vals, axis=-1)
+        action = qnetwork.get_action(obs=obs)
         next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(key_step, env_state, action)
         active = ~ep_dones.astype(bool)
         eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
@@ -380,7 +388,6 @@ def linear_schedule_(start_e: float, end_e: float, duration: int, t: int):
     return jnp.clip(slope * t + start_e, end_e)
 
 
-# polyak_update
 def polyak_update_(network, target_network, tau):
     params = nnx.state(network, nnx.Param)
     target_params = nnx.state(target_network, nnx.Param)
