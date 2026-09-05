@@ -1,5 +1,9 @@
+"""VDN: Value-Decomposition Network
+See: https://cleanmarl-docs.readthedocs.io/en/latest/algorithms/vdn.html"""
+
 import datetime
 import json
+import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -22,7 +26,7 @@ from tensorboardX import SummaryWriter
 class Args:
     # Environment
     env_type: str = "smax"
-    """ smax, mpe """
+    """ smax, mpe, jumanji """
     env_name: str = "3m"
     """ Discrete envs only """
     reward_aggr: str = "mean"
@@ -48,7 +52,7 @@ class Args:
     optimizer: str = "adam"
     """ The optimizer"""
     learning_rate: float = 0.0008
-    """ Learning rate for the actor"""
+    """ Learning rate"""
     gamma: float = 0.99
     """ Discount factor"""
     clip_gradients: float = -1
@@ -84,25 +88,23 @@ class Args:
 
 # -------- Q(s,a) network --------
 class Qnetwork(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, output_dim: int, *, rngs: nnx.Rngs):
+
         layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
             layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
         layers.append(nnx.Linear(hidden_dim, output_dim, rngs=rngs))
+
         self.qnet = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray, avail_actions: jnp.ndarray):
+    def __call__(self, obs, avail_actions):
         qvals = self.qnet(obs)
         qvals = jnp.where(avail_actions, qvals, -1e10)
         return qvals
+
+    def get_action(self, obs, avail_actions):
+        qvals = self(obs, avail_actions)
+        return jnp.argmax(qvals, axis=-1)
 
 
 # -------- States --------
@@ -146,7 +148,7 @@ def train(args):  # noqa: PLR0915
     num_updates = args.total_timesteps // args.num_envs
     assert args.train_freq % args.num_envs == 0, "args.train_freq % args.num_envs != 0"
     assert args.target_network_update_freq % args.num_envs == 0, (
-        "args.target_network_update_freq % args.num_envs == 0 "
+        "args.target_network_update_freq % args.num_envs != 0 "
     )
     assert args.reward_aggr != "none", "VDN works only for common reward"
     # Prepare networks + optimizer
@@ -213,8 +215,7 @@ def train(args):  # noqa: PLR0915
         key_step = jax.random.split(key_step, args.num_envs)
         key_sample = jax.random.split(key_sample, args.num_envs)
         # Get action
-        q_vals = qnetwork(obs=obs, avail_actions=avail_actions)
-        action = jnp.argmax(q_vals, axis=-1)
+        action = qnetwork.get_action(obs=obs, avail_actions=avail_actions)
         eps = eps_scheduler(t=step)
         p_explore = jax.random.uniform(key_eps, (args.num_envs, env.num_agents))
         action = jnp.where(p_explore < eps, env.sample(key_sample, env_state), action)
@@ -232,8 +233,8 @@ def train(args):  # noqa: PLR0915
             battle_won=reward >= 1,
             ep_done=info["__all__"],
         )
-        reward = reward.squeeze(-1)  # vdn works for common reward only
         # Add the step in to the replay buffer
+        reward = reward.squeeze(-1)
         timestep = TimeStep(obs=obs, avail_actions=avail_actions, action=action, reward=reward, done=done)
         buffer = rb_fun.add(buffer, timestep)
 
@@ -315,19 +316,18 @@ def train(args):  # noqa: PLR0915
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
-    qnetwork, _, _, rollout_state, _ = update_state
+    qnetwork, *_ = update_state
     # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
         evaluate(args, qnetwork, eval_key)
     if args.log:
         tb_logger(args, metrics, log_dir)
     if args.save_model:
-        qnetwork, *_ = update_state
         _, qnetwork_state = nnx.split(qnetwork)
-        network_states = {"qnetwork": qnetwork_state}
-        checkpoint_path = (Path(log_dir) / "networks").resolve()
-        with ocp.StandardCheckpointer() as checkpointer:
-            checkpointer.save(checkpoint_path, network_states)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpoint_path = os.path.abspath(f"{log_dir}/policy")
+        checkpointer.save(checkpoint_path, qnetwork_state)
+        checkpointer.wait_until_finished()
         print(f"Networks saved to {checkpoint_path}")
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
@@ -373,11 +373,10 @@ def evaluate(args, qnetwork, eval_key):
         ) = evaluation_state
         eval_key, key_step = jax.random.split(eval_key)
         key_step = jax.random.split(key_step, args.num_eval_ep)
-        q_vals = qnetwork(obs=obs, avail_actions=avail_actions)
-        action = jnp.argmax(q_vals, axis=-1)
+        action = qnetwork.get_action(obs=obs, avail_actions=avail_actions)
         next_obs, _, next_state, reward, _, _, infos = eval_env.step(key_step, env_state, action)
         avail_actions = eval_env.get_avail_actions(next_state)
-        reward = jnp.mean(reward, axis=-1)
+        reward = jnp.sum(reward, axis=-1) if args.reward_aggr == "sum" else jnp.mean(reward, axis=-1)
         active = ~ep_dones.astype(bool)
         eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
         eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
@@ -453,7 +452,6 @@ def linear_schedule_(start_e: float, end_e: float, duration: int, t: int):
     return jnp.clip(slope * t + start_e, end_e)
 
 
-# polyak_update
 def polyak_update_(network, target_network, tau):
     params = nnx.state(network, nnx.Param)
     target_params = nnx.state(target_network, nnx.Param)
