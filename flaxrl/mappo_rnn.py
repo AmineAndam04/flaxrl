@@ -18,7 +18,6 @@ from flax import nnx
 from tensorboardX import SummaryWriter
 
 
-# TODO support reward normalization
 @dataclass
 class Args:
     # Environment
@@ -42,8 +41,10 @@ class Args:
     """num envs"""
     num_steps: int = 2048
     """ Number of collected steps"""
-    batch_size: int = 64
-    """Batch size """
+    ac_batch_size: int = 4
+    """Batch size for the actor"""
+    cr_batch_size: int = 64
+    """ Batch size for the critic """
     n_epochs: int = 3
     """ Number of training epochs"""
     ppo_clip: float = 0.2
@@ -85,21 +86,13 @@ class Args:
 
 # -------- Actor and critic nets --------
 class Actor(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.embed = nnx.Sequential(nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.tanh)
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, *, rngs: nnx.Rngs):
+
+        self.embed = nnx.Sequential(nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu)
         self.lstm = nnx.LSTMCell(in_features=hidden_dim, hidden_features=hidden_dim, rngs=rngs)
         self.logits = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
 
-    def __call__(
-        self, carry: jnp.ndarray, obs: jnp.ndarray, avail_actions: jnp.ndarray
-    ) -> distrax.Categorical:
+    def __call__(self, carry, obs, avail_actions):
         x = self.embed(obs)
         carry, x = self.lstm(carry, x)
         logits = self.logits(x)
@@ -129,7 +122,7 @@ class Actor(nnx.Module):
         pi = distrax.Categorical(logits)
         return pi
 
-    def get_action(self, carry: jnp.ndarray, obs: jnp.ndarray, avail_actions: jnp.ndarray):
+    def get_action(self, carry, obs, avail_actions):
         x = self.embed(obs)
         carry, x = self.lstm(carry, x)
         logits = self.logits(x)
@@ -150,16 +143,14 @@ class Critic(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(
-            nnx.Linear(hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(1), rngs=rngs)
-        )
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, output_dim, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
-    def __call__(self, state: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, state):
         return self.critic(state)
 
 
@@ -209,11 +200,10 @@ def train(args):
     env = make_marl_env(args)
     # Vec training params
     num_steps = args.num_envs * args.num_steps
-    assert (args.num_envs * env.num_agents) % args.batch_size == 0, (
-        "args.num_envs * env.num_agents % args.batch_size != 0"
-    )
-    ac_num_batches = args.num_envs * env.num_agents // args.batch_size
-    cr_num_batches = num_steps * env.num_agents // args.batch_size
+    assert num_steps % args.cr_batch_size == 0
+    assert args.num_envs % args.ac_batch_size == 0
+    ac_num_batches = args.num_envs * env.num_agents // args.ac_batch_size
+    cr_num_batches = num_steps // args.cr_batch_size
     num_updates = args.total_timesteps // num_steps
     # Prepare networks + optimizers
     actor = Actor(
@@ -257,7 +247,7 @@ def train(args):
         key=key,
     )
 
-    # update_step: 1 IPPO update = collect num_steps*num_env steps + compute GAE + PPO updates for n_epochs
+    # update_step: 1 MAPPO update = collect num_steps*num_env steps + compute GAE + PPO updates for n_epochs
     @nnx.jit
     @nnx.scan(
         length=num_updates,
@@ -270,9 +260,7 @@ def train(args):
         initial_lstm_carry = rollout_state.lstm_carry
 
         # ------ Collect env steps ------
-        def collect_rollout(
-            actor: nnx.Module, critic: nnx.Module, rollout_state: RolloutState
-        ) -> tuple[RolloutState, Transition, EpisodeStats]:
+        def collect_rollout(actor, critic, rollout_state):
             # env_one_step : one step for each environment
             def env_one_step(carry, x):
                 # Last rollout state
@@ -439,21 +427,15 @@ def train(args):
             advantages,
             transitions.episode_start,
         )
-        # print(transitions.obs.shape)
-        # print(transitions.action.shape)
-        # print(transitions.avail_actions.shape)
-        # print(transitions.log_prob.shape)
-        # print(transitions.episode_start.shape)
-        # print(advantages.shape)
         ac_batches = jax.tree.map(lambda x: jax.lax.collapse(x, 1, 3), ac_batches)
         ac_batches = jax.tree.map(
             lambda x: jnp.swapaxes(
-                x.reshape((args.num_steps, ac_num_batches, args.batch_size) + x.shape[2:]), 0, 1
+                x.reshape((args.num_steps, ac_num_batches, args.ac_batch_size) + x.shape[2:]), 0, 1
             ),
             ac_batches,
         )
         initial_lstm_carry = jax.tree.map(
-            lambda x: x.reshape(ac_num_batches, args.batch_size, x.shape[-1]),
+            lambda x: x.reshape(ac_num_batches, args.ac_batch_size, x.shape[-1]),
             initial_lstm_carry,
         )
         ac_batches = (*ac_batches, initial_lstm_carry)
@@ -465,7 +447,7 @@ def train(args):
         permutation = jax.random.permutation(permutation_key, num_steps)
         cr_batches = jax.tree.map(lambda x: x[permutation], cr_batches)
         cr_batches = jax.tree.map(
-            lambda x: x.reshape((cr_num_batches // env.num_agents, args.batch_size) + x.shape[1:]), cr_batches
+            lambda x: x.reshape((cr_num_batches, args.cr_batch_size) + x.shape[1:]), cr_batches
         )
         # Train for n_epochs
         (actor, actor_optimizer, critic, critic_optimizer), losses = ppo_epoch(
@@ -490,7 +472,7 @@ def train(args):
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
-    actor, _, critic, _, _, _ = update_state
+    actor, *_ = update_state
 
     # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
@@ -561,7 +543,7 @@ def evaluate(args, actor, eval_key):
         action = action.reshape(args.num_eval_ep, eval_env.num_agents)
         next_obs, _, next_state, reward, _, _, infos = eval_env.step(key_step, env_state, action)
         avail_actions = eval_env.get_avail_actions(next_state)
-        reward = jnp.mean(reward, axis=-1)
+        reward = jnp.sum(reward, axis=-1) if args.reward_aggr == "sum" else jnp.mean(reward, axis=-1)
         active = ~ep_dones.astype(bool)
         eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
         eval_ep_lengths = eval_ep_lengths + active.astype(jnp.int32)
