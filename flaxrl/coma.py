@@ -1,5 +1,9 @@
+"""COMA: Counterfactual Multi-Agent
+See: https://cleanmarl-docs.readthedocs.io/en/latest/algorithms/coma.html"""
+
 import datetime
 import json
+import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -18,7 +22,6 @@ from flax import nnx
 from tensorboardX import SummaryWriter
 
 
-# TODO support reward normalization
 @dataclass
 class Args:
     # Environment
@@ -83,31 +86,22 @@ class Args:
 
 # -------- Actor and critic nets --------
 class Actor(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        output_dim: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, output_dim: int, *, rngs: nnx.Rngs):
+
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(
-            nnx.Linear(hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(0.01), rngs=rngs)
-        )
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, output_dim, rngs=rngs))
+
         self.logits = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray, avail_actions: jnp.ndarray) -> distrax.Categorical:
+    def __call__(self, obs, avail_actions):
         logits = self.logits(obs)
         logits = jnp.where(avail_actions, logits, -1e10)
         pi = distrax.Categorical(logits)
         return pi
 
-    def get_action(self, obs: jnp.ndarray, avail_actions: jnp.ndarray) -> jnp.ndarray:
+    def get_action(self, obs, avail_actions):
         logits = self.logits(obs)
         logits = jnp.where(avail_actions, logits, -1e10)
         return jnp.argmax(logits, axis=-1)
@@ -131,22 +125,20 @@ class Critic(nnx.Module):
         self.other_agent_ids = jnp.array(
             [[j for j in range(num_agents) if i != j] for i in range(num_agents)]
         )
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
+
         self.state_norm = nnx.LayerNorm(s_dim, rngs=rngs)
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu]
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.relu])
-        layers.append(
-            nnx.Linear(hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(1), rngs=rngs)
-        )
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
+        layers.append(nnx.Linear(hidden_dim, output_dim, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
-    def __call__(self, state: jnp.ndarray, obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, state, obs, action):
         state = self.state_norm(state)
         coma_input = self._coma_input(state, obs, action)
         return self.critic(coma_input)
 
-    def _coma_input(self, state: jnp.ndarray, obs: jnp.ndarray, action: jnp.ndarray):
+    def _coma_input(self, state, obs, action):
         action = jax.nn.one_hot(action, self.output_dim)
         action = action[:, self.other_agent_ids].reshape(state.shape[0], self.num_agents, -1)
         state = jnp.repeat(state[:, None, :], self.num_agents, axis=1)
@@ -251,7 +243,7 @@ def train(args):
         )
 
         # ------ Collect env steps ------
-        def collect_rollout(actor: nnx.Module, target_critic: nnx.Module, rollout_state: RolloutState):
+        def collect_rollout(actor, target_critic, rollout_state):
             # env_one_step : one step for each environment
             def env_one_step(carry, _):
                 # Last rollout state
@@ -268,7 +260,7 @@ def train(args):
                     arr=values, indices=jnp.expand_dims(action, axis=-1), axis=-1
                 ).squeeze(axis=-1)
                 # Step the env
-                next_obs, next_state, next_env_state, reward, terminated, truncated, info = env.step(
+                next_obs, next_state, next_env_state, reward, terminated, _, info = env.step(
                     key_step, env_state, action
                 )
                 next_avail_actions = env.get_avail_actions(next_env_state)
@@ -352,7 +344,6 @@ def train(args):
 
             # Update the critic
             def ppo_critic_loss(critic, b_state, b_obs, b_action, b_td_returns):
-                # TODO try using the new values
                 all_values = critic(b_state, b_obs, b_action)
                 values = jnp.take_along_axis(
                     arr=all_values, indices=jnp.expand_dims(b_action, axis=-1), axis=-1
@@ -360,7 +351,7 @@ def train(args):
                 cr_loss = optax.l2_loss(values, b_td_returns).mean()
                 return cr_loss, (all_values, values)
 
-            (cr_loss, all_values), cr_grads = nnx.value_and_grad(ppo_critic_loss, has_aux=True)(
+            (cr_loss, b_values), cr_grads = nnx.value_and_grad(ppo_critic_loss, has_aux=True)(
                 critic,
                 batch_transition.state,
                 batch_transition.obs,
@@ -386,7 +377,7 @@ def train(args):
                 batch_transition.obs,
                 batch_transition.action,
                 batch_transition.avail_actions,
-                all_values,
+                b_values,
             )
             actor_optimizer.update(actor, ac_grads)
             carry = (actor, actor_optimizer, critic, critic_optimizer)
@@ -426,7 +417,7 @@ def train(args):
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
-    actor, _, critic, *_ = update_state
+    actor, *_ = update_state
 
     # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
@@ -435,15 +426,13 @@ def train(args):
         tb_logger(args, metrics, log_dir, num_updates)
     if args.save_model:
         _, actor_state = nnx.split(actor)
-        _, critic_state = nnx.split(critic)
-        network_states = {"actor": actor_state, "critic": critic_state}
-        checkpoint_path = (Path(log_dir) / "networks").resolve()
-        with ocp.StandardCheckpointer() as checkpointer:
-            checkpointer.save(checkpoint_path, network_states)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpoint_path = os.path.abspath(f"{log_dir}/policy")
+        checkpointer.save(checkpoint_path, actor_state)
+        checkpointer.wait_until_finished()
         print(f"Networks saved to {checkpoint_path}")
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
-    return update_state, metrics
 
 
 def evaluate(args, actor, eval_key):
