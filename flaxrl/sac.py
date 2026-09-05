@@ -1,5 +1,8 @@
+"""Soft Actor-Critic"""
+
 import datetime
 import json
+import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -104,23 +107,24 @@ class Actor(nnx.Module):
         hidden_dim: int,
         num_layers: int,
         output_dim: int,
-        action_low,
-        action_high,
+        action_low: jnp.ndarray,
+        action_high: jnp.ndarray,
         *,
         rngs: nnx.Rngs,
     ):
+
         layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
             layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
         self.enc = nnx.Sequential(*layers)
-
         self.mean = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
         self.log_std = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
+
         # action scaling
         self.action_scale = (action_high - action_low) / 2.0
         self.action_bias = (action_high + action_low) / 2.0
 
-    def __call__(self, obs: jnp.ndarray, key):
+    def __call__(self, obs, key):
         x = self.enc(obs)
         mean = self.mean(x)
         log_std = self.log_std(x)
@@ -136,28 +140,22 @@ class Actor(nnx.Module):
         log_prob -= jnp.log(self.action_scale * (1.0 - squashed_action**2) + 1e-6)
         return action, log_prob.sum(axis=-1)
 
-    def get_mean(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def get_action(self, obs: jnp.ndarray) -> jnp.ndarray:
         x = self.enc(obs)
         mean = self.mean(x)
         return jnp.tanh(mean) * self.action_scale + self.action_bias
 
 
 class Critic(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, *, rngs: nnx.Rngs):
+
         layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
             layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
         layers.append(nnx.Linear(hidden_dim, 1, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs, action):
         return self.critic(jnp.concat([obs, action], axis=-1)).squeeze(-1)
 
 
@@ -200,6 +198,9 @@ def train(args):  # noqa: PLR0915
     # Vec training params
     num_updates = args.total_timesteps // args.num_envs
     assert args.train_freq % args.num_envs == 0, "args.train_freq % args.num_envs != 0"
+    assert args.target_network_update_freq % args.num_envs == 0, (
+        "args.target_network_update_freq % args.num_envs != 0"
+    )
     # Rng keys
     key = jax.random.key(args.seed)
     rngs = nnx.Rngs(args.seed)
@@ -324,11 +325,12 @@ def train(args):  # noqa: PLR0915
             key_sample,
             key_act,
         ):
+            key_act, key_act_target = jax.random.split(key_act)
             # Sample a batch
             batch = rb_fun.sample(buffer, key_sample).experience
             # ---- Update critics
             # compute targets
-            next_action, next_log_prog = actor(obs=batch.second.obs, key=key_act)
+            next_action, next_log_prog = actor(obs=batch.second.obs, key=key_act_target)
             q1_vals_next = target_critic["qnet1"](obs=batch.second.obs, action=next_action)
             q2_vals_next = target_critic["qnet2"](obs=batch.second.obs, action=next_action)
             q_vals_next = jnp.minimum(q1_vals_next, q2_vals_next) - alpha * next_log_prog
@@ -347,7 +349,7 @@ def train(args):  # noqa: PLR0915
             critic_optimizer.update(critic, grads)
 
             # ---- Update the actor
-            # actor_loss: log_prob can be used to update the temperature
+            # actor_loss: log_prob is used to update the temperature
             def actor_loss(actor):
                 action, log_prob = actor(obs=batch.first.obs, key=key_act)
                 q1_values = critic["qnet1"](obs=batch.first.obs, action=action)
@@ -458,12 +460,22 @@ def train(args):  # noqa: PLR0915
         tb_logger(args, metrics, log_dir)
     if args.save_model:
         _, actor_state = nnx.split(actor)
-        _, critic_state = nnx.split(critic)
-        network_states = {"actor": actor_state, "critic": critic_state}
-        checkpoint_path = (Path(log_dir) / "networks").resolve()
-        with ocp.StandardCheckpointer() as checkpointer:
-            checkpointer.save(checkpoint_path, network_states)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpoint_path = os.path.abspath(f"{log_dir}/policy")
+        checkpointer.save(checkpoint_path, actor_state)
+        checkpointer.wait_until_finished()
         print(f"Networks saved to {checkpoint_path}")
+        # Save normalization statistics
+        if args.normalize_obs:
+            from envs.make_env import get_state
+            from envs.wrappers import NormalizeVecObservationState
+
+            normalization_state = get_state(rollout_state, NormalizeVecObservationState)
+            np.savez(
+                Path(log_dir) / "obs_normalization.npz",
+                mean=np.asarray(normalization_state.mean),
+                var=np.asarray(normalization_state.var),
+            )
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
 
@@ -488,7 +500,7 @@ def evaluate(args, actor, rollout_state, eval_key):
         obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key = evaluation_state
         eval_key, key_step = jax.random.split(eval_key)
         key_step = jax.random.split(key_step, args.num_eval_ep)
-        action = actor.get_mean(obs=obs)
+        action = actor.get_action(obs=obs)
         next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(key_step, env_state, action)
         active = ~ep_dones.astype(bool)
         eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
