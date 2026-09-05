@@ -1,5 +1,8 @@
+"""PPO with recurrent policies"""
+
 import datetime
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +20,6 @@ from flax import nnx
 from tensorboardX import SummaryWriter
 
 
-# TODO remove unused shuffle key
 @dataclass
 class Args:
     # Environment
@@ -49,11 +51,11 @@ class Args:
     # Training
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
-    num_envs: int = 8
+    num_envs: int = 32
     """num envs"""
     num_steps: int = 2048
     """ Number of collected steps"""
-    batch_size: int = 64
+    batch_size: int = 8
     """Batch size """
     n_epochs: int = 3
     """ Number of training epochs"""
@@ -97,27 +99,14 @@ class Args:
 # -------- Actor and critic nets --------
 class Actor(nnx.Module):
     def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        log_std_init: float,
-        *,
-        rngs: nnx.Rngs,
+        self, input_dim: int, hidden_dim: int, output_dim: int, log_std_init: float, *, rngs: nnx.Rngs
     ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        self.embed = nnx.Sequential(
-            nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.tanh
-        )
-        self.lstm = nnx.LSTMCell(
-            in_features=hidden_dim, hidden_features=hidden_dim, kernel_init=kernel_init, rngs=rngs
-        )
-        self.mean = nnx.Linear(
-            hidden_dim, output_dim, kernel_init=nnx.initializers.orthogonal(0.01), rngs=rngs
-        )
+        self.embed = nnx.Sequential(nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.tanh)
+        self.lstm = nnx.LSTMCell(in_features=hidden_dim, hidden_features=hidden_dim, rngs=rngs)
+        self.mean = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
         self.log_std = nnx.Param(jnp.zeros(output_dim) + log_std_init)
 
-    def __call__(self, carry, obs) -> distrax.MultivariateNormalDiag:
+    def __call__(self, carry, obs):
         x = self.embed(obs)
         carry, x = self.lstm(carry, x)
         mean = self.mean(x)
@@ -147,7 +136,7 @@ class Actor(nnx.Module):
         pi = distrax.MultivariateNormalDiag(mean, jnp.exp(log_std))
         return pi
 
-    def get_mean(self, carry, obs) -> jnp.ndarray:
+    def get_action(self, carry, obs):
         x = self.embed(obs)
         carry, x = self.lstm(carry, x)
         mean = self.mean(x)
@@ -158,22 +147,14 @@ class Actor(nnx.Module):
 
 
 class Critic(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        kernel_init = nnx.initializers.orthogonal(np.sqrt(2))
-        layers = [nnx.Linear(input_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.tanh]
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, *, rngs: nnx.Rngs):
+        layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.tanh]
         for _ in range(num_layers - 1):
-            layers.extend([nnx.Linear(hidden_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs), nnx.tanh])
-        layers.append(nnx.Linear(hidden_dim, 1, kernel_init=nnx.initializers.orthogonal(1), rngs=rngs))
+            layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.tanh])
+        layers.append(nnx.Linear(hidden_dim, 1, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs: jnp.ndarray):
         return self.critic(obs).squeeze(-1)
 
 
@@ -216,7 +197,7 @@ def train(args):
     # Rng keys
     key = jax.random.key(args.seed)
     rngs = nnx.Rngs(args.seed)
-    key, reset_key, shuffle_key, eval_key = jax.random.split(key, 4)
+    key, reset_key, eval_key = jax.random.split(key, 3)
     # Import the environment
     env = make_env(args)
     # Prepare networks + optimizes
@@ -265,7 +246,7 @@ def train(args):
     )
     def update_step(update_state: tuple, _):  # noqa: PLR0915
 
-        actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key = update_state
+        actor, actor_optimizer, critic, critic_optimizer, rollout_state = update_state
         initial_lstm_carry = rollout_state.lstm_carry
 
         # ------ Collect env steps ------
@@ -402,8 +383,9 @@ def train(args):
 
         # ------ Prepare training batches ------
         # We batch over episodes: consume 'batch_size' env every mini-batch update
-        # From (args.num_steps, num_envs,**) to (args.num_steps,batch_size, num_envs// batch_size, **)
+        # From (args.num_steps, num_envs,**) to (args.num_steps,num_batches,batch_size, **)
         # We then switch the first two dims
+        dones = transitions.done
         transitions, advantages, returns = jax.tree.map(
             lambda x: jnp.swapaxes(
                 x.reshape((args.num_steps, num_batches, args.batch_size) + x.shape[2:]), 0, 1
@@ -420,20 +402,20 @@ def train(args):
         (actor, actor_optimizer, critic, critic_optimizer), losses = ppo_epoch(
             (actor, actor_optimizer, critic, critic_optimizer), batches
         )
-        update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key
+        update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state
         losses = jax.tree.map(lambda x: x.mean(), losses)
-        metrics = *losses, transitions.done, episode_stats.episode_return, episode_stats.episode_length
+        metrics = *losses, dones, episode_stats.episode_return, episode_stats.episode_length
         return update_state, metrics
 
     # ------ Run PPO ------
-    update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state, shuffle_key
+    update_state = actor, actor_optimizer, critic, critic_optimizer, rollout_state
     start_time = time.perf_counter()
     update_state, metrics = update_step(update_state, None)
     jax.block_until_ready(metrics)
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
     print(f"Training time: {elapsed_time / 60:.2f} min ({elapsed_time:.2f} sec)")
-    actor, _, critic, _, rollout_state, _ = update_state
+    actor, _, critic, _, rollout_state = update_state
     # ------ Evaluate + tensorboard logging + checkpoints ------
     if args.eval:
         evaluate(args, actor, rollout_state, eval_key)
@@ -441,24 +423,33 @@ def train(args):
         tb_logger(args, metrics, log_dir, num_updates)
     if args.save_model:
         _, actor_state = nnx.split(actor)
-        _, critic_state = nnx.split(critic)
-        network_states = {"actor": actor_state, "critic": critic_state}
-        checkpoint_path = (Path(log_dir) / "networks").resolve()
-        with ocp.StandardCheckpointer() as checkpointer:
-            checkpointer.save(checkpoint_path, network_states)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpoint_path = os.path.abspath(f"{log_dir}/policy")
+        checkpointer.save(checkpoint_path, actor_state)
+        checkpointer.wait_until_finished()
         print(f"Networks saved to {checkpoint_path}")
+        # Save normalization statistics
+        if args.normalize_obs:
+            from envs.make_env import get_state
+            from envs.wrappers import NormalizeVecObservationState
+
+            normalization_state = get_state(rollout_state, NormalizeVecObservationState)
+            np.savez(
+                Path(log_dir) / "obs_normalization.npz",
+                mean=np.asarray(normalization_state.mean),
+                var=np.asarray(normalization_state.var),
+            )
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
 
 
 def evaluate(args, actor, rollout_state, eval_key):
-    rngs = nnx.Rngs(args.seed)
     eval_env = make_env(args, eval=True, rollout_state=rollout_state)
     eval_key, reset_key = jax.random.split(eval_key)
     reset_key = jax.random.split(reset_key, args.num_eval_ep)
     obs, env_state = eval_env.reset(reset_key)
     # Initialize hidden state
-    eval_lstm_carry = actor.lstm.initialize_carry((args.num_eval_ep, args.actor_hidden_dim), rngs=rngs)
+    eval_lstm_carry = actor.initialize_carry(args.num_eval_ep, args.actor_hidden_dim)
     # Initialize metrics
     eval_ep_returns = jnp.zeros(args.num_eval_ep)
     eval_ep_lengths = jnp.zeros(args.num_eval_ep, dtype=jnp.int32)
@@ -476,7 +467,7 @@ def evaluate(args, actor, rollout_state, eval_key):
         )
         eval_key, key_step = jax.random.split(eval_key)
         key_step = jax.random.split(key_step, args.num_eval_ep)
-        eval_lstm_carry, action = actor.get_mean(eval_lstm_carry, obs)
+        eval_lstm_carry, action = actor.get_action(eval_lstm_carry, obs)
         next_obs, next_state, reward, terminated, truncated, _ = eval_env.step(key_step, env_state, action)
         active = ~ep_dones.astype(bool)
         eval_ep_returns = eval_ep_returns + jnp.where(active, reward, 0.0)
