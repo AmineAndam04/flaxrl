@@ -1,8 +1,9 @@
-"""TD3"""
+"""Twin Delayed DDPG"""
 
 # TODO: it takes way more time to train than SAC
 import datetime
 import json
+import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -74,8 +75,6 @@ class Args:
     """ Discount factor"""
     clip_gradients: float = -1
     """ Disable gradient clipping when <= 0; otherwise clip at this value"""
-    target_network_update_freq: int = 10
-    """ Update the target network every target_network_update_freq step in the environment"""
     polyak: float = 0.005
     """ Polyak coefficient for target network update"""
     act_noise: float = 0.1
@@ -120,34 +119,28 @@ class Actor(nnx.Module):
         for _ in range(num_layers - 1):
             layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
         self.enc = nnx.Sequential(*layers)
-
         self.mean = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
+
         # action scaling
         self.action_scale = (action_high - action_low) / 2.0
         self.action_bias = (action_high + action_low) / 2.0
 
-    def __call__(self, obs: jnp.ndarray):
+    def __call__(self, obs):
         x = self.enc(obs)
         mean = self.mean(x)
         return jnp.tanh(mean) * self.action_scale + self.action_bias
 
 
 class Critic(nnx.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        *,
-        rngs: nnx.Rngs,
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, *, rngs: nnx.Rngs):
+
         layers = [nnx.Linear(input_dim, hidden_dim, rngs=rngs), nnx.relu]
         for _ in range(num_layers - 1):
             layers.extend([nnx.Linear(hidden_dim, hidden_dim, rngs=rngs), nnx.relu])
         layers.append(nnx.Linear(hidden_dim, 1, rngs=rngs))
         self.critic = nnx.Sequential(*layers)
 
-    def __call__(self, obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs, action):
         return self.critic(jnp.concat([obs, action], axis=-1)).squeeze(-1)
 
 
@@ -300,14 +293,7 @@ def train(args):
 
         # ------ Update critics and the  ------
         def update_actor_and_critic(
-            actor,
-            actor_optimizer,
-            critic,
-            target_critic,
-            critic_optimizer,
-            update_actor_event,
-            key_sample,
-            key_noise,
+            actor, actor_optimizer, critic, critic_optimizer, update_actor_event, key_sample, key_noise
         ):
             # Sample a batch
             batch = rb_fun.sample(buffer, key_sample).experience
@@ -322,7 +308,6 @@ def train(args):
             q_vals_next = jnp.minimum(q1_vals_next, q2_vals_next)
             targets = batch.first.reward + args.gamma * (1 - batch.first.done) * q_vals_next
 
-            # critic_loss
             def critic_loss(critic):
                 q1_values = critic["qnet1"](obs=batch.first.obs, action=batch.first.action)
                 q1_loss = optax.l2_loss(targets, q1_values).mean()
@@ -330,13 +315,11 @@ def train(args):
                 q2_loss = optax.l2_loss(targets, q2_values).mean()
                 return q1_loss + q2_loss
 
-            # Update the critics
             cr_loss, grads = nnx.value_and_grad(critic_loss)(critic)
             critic_optimizer.update(critic, grads)
 
             # ---- Update the actor
             def update_actor(actor, actor_optimizer, obs):
-                # actor_loss
                 def actor_loss(actor):
                     action = actor(obs=obs)
                     q_values = critic["qnet1"](obs=obs, action=action)
@@ -376,7 +359,6 @@ def train(args):
             actor,
             actor_optimizer,
             critic,
-            target_critic,
             critic_optimizer,
             update_actor_event,
             key_sample,
@@ -446,12 +428,22 @@ def train(args):
         tb_logger(args, metrics, log_dir)
     if args.save_model:
         _, actor_state = nnx.split(actor)
-        _, critic_state = nnx.split(critic)
-        network_states = {"actor": actor_state, "critic": critic_state}
-        checkpoint_path = (Path(log_dir) / "networks").resolve()
-        with ocp.StandardCheckpointer() as checkpointer:
-            checkpointer.save(checkpoint_path, network_states)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpoint_path = os.path.abspath(f"{log_dir}/policy")
+        checkpointer.save(checkpoint_path, actor_state)
+        checkpointer.wait_until_finished()
         print(f"Networks saved to {checkpoint_path}")
+        # Save normalization statistics
+        if args.normalize_obs:
+            from envs.make_env import get_state
+            from envs.wrappers import NormalizeVecObservationState
+
+            normalization_state = get_state(rollout_state, NormalizeVecObservationState)
+            np.savez(
+                Path(log_dir) / "obs_normalization.npz",
+                mean=np.asarray(normalization_state.mean),
+                var=np.asarray(normalization_state.var),
+            )
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
 
@@ -467,7 +459,7 @@ def evaluate(args, actor, rollout_state, eval_key):
     ep_dones = jnp.zeros(args.num_eval_ep, dtype=jnp.bool_)
     evaluation_state = (obs, env_state, eval_ep_returns, eval_ep_lengths, ep_dones, eval_key)
 
-    # Stops once all envs are done
+    # Stop once all envs are done
     def cond_fun(evaluation_state):
         return ~jnp.all(evaluation_state[-2])
 
@@ -541,7 +533,6 @@ def tb_logger(args, metrics, log_dir):
     writer.close()
 
 
-# polyak_update
 def polyak_update_(network, target_network, tau):
     params = nnx.state(network, nnx.Param)
     target_params = nnx.state(target_network, nnx.Param)
