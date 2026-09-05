@@ -87,17 +87,18 @@ class Actor(nnx.Module):
         self.linear_layer = nnx.Linear(1024, 128, rngs=rngs)
         self.logits = nnx.Linear(128, output_dim, rngs=rngs)
 
-    def __call__(self, obs: jnp.ndarray):
-        x = nnx.relu(self.conv(obs))
+    def __call__(self, obs):
+        x = obs.astype(jnp.float32)
+        x = nnx.relu(self.conv(x))
         x = x.reshape(x.shape[0], -1)
         x = nnx.relu(self.linear_layer(x))
         logits = self.logits(x)
         pi = distrax.Categorical(logits)
         return pi
 
-    def get_action(self, obs: jnp.ndarray):
+    def get_action(self, obs):
         x = obs.astype(jnp.float32)
-        x = nnx.relu(self.conv(obs))
+        x = nnx.relu(self.conv(x))
         x = x.reshape(x.shape[0], -1)
         x = nnx.relu(self.linear_layer(x))
         logits = self.logits(x)
@@ -111,9 +112,9 @@ class Critic(nnx.Module):
         self.linear_layer = nnx.Linear(1024, 128, rngs=rngs)
         self.critic = nnx.Linear(128, 1, rngs=rngs)
 
-    def __call__(self, obs: jnp.ndarray):
+    def __call__(self, obs):
         x = obs.astype(jnp.float32)
-        x = nnx.relu(self.conv(obs))
+        x = nnx.relu(self.conv(x))
         x = x.reshape(x.shape[0], -1)
         x = nnx.relu(self.linear_layer(x))
         value = self.critic(x)
@@ -358,6 +359,17 @@ def train(args):
         checkpointer.save(checkpoint_path, actor_state)
         checkpointer.wait_until_finished()
         print(f"Networks saved to {checkpoint_path}")
+        # Save normalization statistics
+        if args.normalize_obs:
+            from envs.make_env import get_state
+            from envs.wrappers import NormalizeVecObservationState
+
+            normalization_state = get_state(rollout_state, NormalizeVecObservationState)
+            np.savez(
+                Path(log_dir) / "obs_normalization.npz",
+                mean=np.asarray(normalization_state.mean),
+                var=np.asarray(normalization_state.var),
+            )
         with open(Path(log_dir) / "args.json", "w") as file:
             json.dump(vars(args), file, indent=2)
 
