@@ -105,7 +105,7 @@ if __name__ == "__main__":
     while True:
         key, key_step = jax.random.split(key)
         key_step = jax.random.split(key_step, 1)
-        lstm_carry, action = policy.get_action(lstm_carry, obs)
+        lstm_carry, action = get_action(lstm_carry, obs)
         next_obs, next_env_state, reward, terminated, truncated, _ = jitted_step(key_step, env_state, action)
         done = terminated or truncated
         state_seq.append(jax.tree.map(lambda x: x.squeeze(0), env_state))
@@ -117,9 +117,15 @@ if __name__ == "__main__":
             step += 1
     print("++ STATES COLLECTED")
     # Rendering
-    frames = env.unwrapped.env.render(state_seq)
+    try:
+        frames = env.unwrapped.env.render(state_seq)
+    except:
+        frames = env.unwrapped.env.render(
+            state_seq,
+            height=480,
+            width=640,
+            camera="cam0",
+        )
     os.makedirs(f"{args.output}/{train_args.env_name}", exist_ok=True)
     fps = 1.0 / env.unwrapped.env.dt / 2
-    print(fps)
     media.write_video(f"{args.output}/{train_args.env_name}/vid.mp4", frames, fps=fps)
-    # media.show_video(frames, fps=1.0 / env.unwrapped.env.dt)
