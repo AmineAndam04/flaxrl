@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,25 +13,37 @@ from .core import JaxRLEnv
 class PlaygroundInterface(JaxRLEnv):
     env: Any
     env_name: str
+    _get_obs: Any
+    _obs_size: int
 
     @classmethod
-    def make(cls, env_name: str, impl: str = "jax"):
+    def make(cls, env_name: str, impl: str = "jax", which_obs="state"):
         config_overrides = {"impl": impl}
         env = registry.load(env_name=env_name, config_overrides=config_overrides)
-        return cls(env=env, env_name=env_name)
+        obs_size = env.observation_size
+
+        if isinstance(obs_size, Mapping):
+            assert which_obs in obs_size
+            _get_obs = lambda x: x[which_obs]
+            _obs_size = obs_size[which_obs][0]
+        else:
+            _get_obs = lambda x: x
+            _obs_size = obs_size
+
+        return cls(env=env, env_name=env_name, _get_obs=_get_obs, _obs_size=_obs_size)
 
     def reset(self, key) -> tuple[Any, Any]:
         state = self.env.reset(rng=key)
-        return state.obs, state
+        return self._get_obs(state.obs), state
 
     def step(self, key, state, action):
         state = self.env.step(state=state, action=action)
         info = {**state.metrics, **state.info}
-        return state.obs, state, state.reward, state.done, False, info
+        return self._get_obs(state.obs), state, state.reward, state.done, False, info
 
     @property
     def observation_space(self):
-        obs_size = self.env.observation_size
+        obs_size = self._obs_size
         obs = jnp.inf * jnp.ones(obs_size)
         observation_space = spaces.Box(low=-obs, high=obs, shape=(obs_size,))
         return observation_space
@@ -47,7 +60,7 @@ class PlaygroundInterface(JaxRLEnv):
 
     @property
     def observation_size(self):
-        return self.env.observation_size
+        return self._obs_size
 
     @property
     def action_size(self):
