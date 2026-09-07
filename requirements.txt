@@ -4,7 +4,6 @@ distrax==0.1.9
 flashbax==0.1.3
 brax==0.14.2
 playground==0.2.0
-gymnax==1.0.0
-jaxmarl==0.1.0
+jumanji==1.1.2
 tyro
 imageio
